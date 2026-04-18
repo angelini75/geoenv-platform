@@ -1,0 +1,33 @@
+services:
+  geoenv:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: geoenv_platform
+    restart: unless-stopped
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/secrets/credentials.json
+      - GEE_PROJECT=ee-angelini75
+    volumes:
+      # Mount the shared service-account key from the parent stack
+      - /opt/mi-stack/secrets:/app/secrets:ro
+    networks:
+      - mi-stack_webnet
+    labels:
+      - "traefik.enable=true"
+      # HTTPS router
+      - "traefik.http.routers.geoenv.rule=Host(`indicadores.soildecisions.com`)"
+      - "traefik.http.routers.geoenv.entrypoints=websecure"
+      - "traefik.http.routers.geoenv.tls=true"
+      - "traefik.http.routers.geoenv.tls.certresolver=myresolver"
+      - "traefik.http.services.geoenv.loadbalancer.server.port=8000"
+      # HTTP → HTTPS redirect
+      - "traefik.http.routers.geoenv-http.rule=Host(`indicadores.soildecisions.com`)"
+      - "traefik.http.routers.geoenv-http.entrypoints=web"
+      - "traefik.http.routers.geoenv-http.middlewares=redirect-to-https"
+      - "traefik.docker.network=mi-stack_webnet"
+
+networks:
+  # Join the existing Traefik network created by the parent stack
+  mi-stack_webnet:
+    external: true
