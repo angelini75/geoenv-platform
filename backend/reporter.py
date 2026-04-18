@@ -143,6 +143,7 @@ def stream_report(analysis_data: dict):
                 yield f"data: {payload}\n\n"
     except Exception as e:
         logger.exception("Report generation failed")
-        yield f'data: {json.dumps({"chunk": f"\\n\\n⚠ Error generando informe: {e}"})}\n\n'
+        err_msg = f"\n\n⚠ Error generando informe: {e}"
+        yield f"data: {json.dumps({'chunk': err_msg})}\n\n"
 
     yield "data: [DONE]\n\n"
