@@ -316,7 +316,7 @@ body {
   font-size: .7rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: .6px; color: var(--text-dim);
 }
-.chart-wrap { height: 220px; padding: 4px; }
+.chart-wrap { height: 230px; overflow: hidden; }   /* no padding — LW Charts fills container */
 
 /* ── Socio section ── */
 .socio-section {

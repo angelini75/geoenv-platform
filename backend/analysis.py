@@ -8,13 +8,14 @@ Data sources:
   CHIRPS   : Precipitation         (daily, 5.5 km)
 
 Derived: VCI, TCI, VHI  (from NDVI + LST historical min/max)
-Historical baseline: 2015-2024, same calendar months.
+Historical baseline: 2004-2024, same calendar months (20 years of MODIS).
+Chart series: last 3 years of monthly OHLC candlesticks.
 GEE fetches run in parallel threads to minimize latency.
 """
 import ee
 import math
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
 from collections import defaultdict
@@ -31,8 +32,9 @@ SCALE_DAYS = {
     "1w": 7, "2w": 14, "1m": 30, "2m": 60,
     "3m": 90, "6m": 180, "1y": 365,
 }
-HIST_START = "2015-01-01"
-HIST_END   = "2024-12-31"
+HIST_START  = "2004-01-01"   # 20-year MODIS baseline
+HIST_END    = "2024-12-31"
+CHART_YEARS = 3              # candlestick chart shows last N years of monthly candles
 
 
 # ---------------------------------------------------------------------------
@@ -74,56 +76,69 @@ def _calendar_months(start: date, end: date) -> tuple[int, int]:
 
 def _direction(index: str, o: float, c: float) -> str:
     if c > o:
-        labels = {"ndvi": "Alcista (recuperación)", "evi": "Alcista (recuperación)",
-                  "savi": "Alcista (recuperación)", "ndwi": "Alcista (recarga hídrica)",
-                  "mndwi": "Alcista (agua superficial +)", "vci": "Alcista (condición vegetal +)",
-                  "vhi": "Alcista (salud ecosistema +)", "lst": "Alcista (estrés térmico)",
-                  "tci": "Alcista (condición térmica +)", "nbr": "Alcista (biomasa +)"}
+        labels = {
+            "ndvi": "Alcista (recuperación)", "evi": "Alcista (recuperación)",
+            "savi": "Alcista (recuperación)", "ndwi": "Alcista (recarga hídrica)",
+            "mndwi": "Alcista (agua superficial +)", "vci": "Alcista (condición vegetal +)",
+            "tci": "Alcista (condición térmica +)", "vhi": "Alcista (salud ecosistema +)",
+            "lst": "Alcista (estrés térmico)", "nbr": "Alcista (biomasa +)",
+        }
         return labels.get(index, "Alcista")
     elif c < o:
-        labels = {"ndvi": "Bajista (estrés/degradación)", "evi": "Bajista (estrés/degradación)",
-                  "savi": "Bajista (suelo expuesto +)", "ndwi": "Bajista (déficit hídrico)",
-                  "mndwi": "Bajista (agua superficial −)", "vci": "Bajista (sequía agrícola)",
-                  "vhi": "Bajista (deterioro ecosistema)", "lst": "Bajista (enfriamiento)",
-                  "tci": "Bajista (estrés térmico +)", "nbr": "Bajista (degradación/fuego)"}
+        labels = {
+            "ndvi": "Bajista (estrés/degradación)", "evi": "Bajista (estrés/degradación)",
+            "savi": "Bajista (suelo expuesto +)", "ndwi": "Bajista (déficit hídrico)",
+            "mndwi": "Bajista (agua superficial −)", "vci": "Bajista (sequía agrícola)",
+            "tci": "Bajista (estrés térmico +)", "vhi": "Bajista (deterioro ecosistema)",
+            "lst": "Bajista (enfriamiento)", "nbr": "Bajista (degradación/fuego)",
+        }
         return labels.get(index, "Bajista")
     return "Neutro"
 
 
-def _build_candlesticks(series: list[dict], hist_mean: float, hist_std: float,
-                        index: str, scale: str) -> list[dict]:
+def _monthly_candles(series: list[dict], hist_mean: float, hist_std: float,
+                     index: str) -> list[dict]:
+    """
+    Group a time-series into monthly OHLC candles.
+    Period key format: YYYY-MM-DD (first day of month) → compatible with TradingView.
+    """
     if not series:
         return []
-    group = "week" if SCALE_DAYS.get(scale, 30) <= 14 else "month"
-
-    def key(d):
-        dt = date.fromisoformat(d)
-        return f"{dt.isocalendar()[0]}-W{dt.isocalendar()[1]:02d}" if group == "week" else d[:7]
 
     groups: dict[str, list] = defaultdict(list)
     for pt in series:
-        groups[key(pt["date"])].append(pt["value"])
+        month_key = pt["date"][:7]   # YYYY-MM
+        groups[month_key].append(pt["value"])
 
     out = []
-    for period in sorted(groups):
-        vals = groups[period]
+    for ym in sorted(groups):
+        vals = groups[ym]
         if not vals:
             continue
         o, c, h, lo = vals[0], vals[-1], max(vals), min(vals)
         z = _zscore(c, hist_mean, hist_std)
         out.append({
-            "period": period, "open": round(o, 5), "close": round(c, 5),
-            "high": round(h, 5), "low": round(lo, 5), "range": round(h - lo, 5),
-            "direction": _direction(index, o, c), "z_close": z,
-            "anomaly_class": _classify(z), "n_observations": len(vals),
+            "period":         ym + "-01",       # YYYY-MM-DD
+            "open":           round(o,  5),
+            "close":          round(c,  5),
+            "high":           round(h,  5),
+            "low":            round(lo, 5),
+            "range":          round(h - lo, 5),
+            "direction":      _direction(index, o, c),
+            "z_close":        z,
+            "anomaly_class":  _classify(z),
+            "n_observations": len(vals),
         })
     return out
 
 
-def _summarize(series: list[dict], hist: dict, index: str, scale: str,
+def _summarize(cur_series: list[dict], chart_series: list[dict],
+               hist: dict, index: str, scale: str,
                current_override=None) -> dict:
-    val = current_override if current_override is not None else (series[-1]["value"] if series else None)
-    z   = _zscore(val, hist["mean"], hist["std"])
+    val = (current_override if current_override is not None
+           else (cur_series[-1]["value"] if cur_series else None))
+    z = _zscore(val, hist["mean"], hist["std"])
+    candles = _monthly_candles(chart_series, hist["mean"], hist["std"], index)
     return {
         "current":        round(val, 5) if val is not None else None,
         "hist_mean":      hist["mean"],
@@ -133,15 +148,53 @@ def _summarize(series: list[dict], hist: dict, index: str, scale: str,
         "z_score":        z,
         "pct_deviation":  _pct_dev(val, hist["mean"]),
         "anomaly_class":  _classify(z),
-        "candlesticks":   _build_candlesticks(series, hist["mean"], hist["std"], index, scale),
-        "n_observations": len(series),
+        "candlesticks":   candles,
+        "n_observations": len(cur_series),
         "hist_n_images":  hist["count"],
     }
 
 
 # ---------------------------------------------------------------------------
+# Derived index series helpers (no extra GEE calls)
+# ---------------------------------------------------------------------------
+
+def _vci_series(ndvi_series: list[dict], hmin: float, hmax: float) -> list[dict]:
+    denom = hmax - hmin
+    if denom == 0:
+        return []
+    return [{"date": pt["date"],
+             "value": round(max(0.0, min(1.0, (pt["value"] - hmin) / denom)), 4)}
+            for pt in ndvi_series]
+
+
+def _tci_series(lst_series: list[dict], hmin: float, hmax: float) -> list[dict]:
+    denom = hmax - hmin
+    if denom == 0:
+        return []
+    return [{"date": pt["date"],
+             "value": round(max(0.0, min(1.0, (hmax - pt["value"]) / denom)), 4)}
+            for pt in lst_series]
+
+
+def _vhi_series(vci_s: list[dict], tci_s: list[dict]) -> list[dict]:
+    vci_map = {pt["date"][:7]: pt["value"] for pt in vci_s}
+    tci_map = {pt["date"][:7]: pt["value"] for pt in tci_s}
+    out = []
+    for ym in sorted(set(vci_map) & set(tci_map)):
+        out.append({"date": ym + "-01",
+                    "value": round(0.5 * vci_map[ym] + 0.5 * tci_map[ym], 4)})
+    return out
+
+
+# ---------------------------------------------------------------------------
 # GEE fetch functions (run in parallel)
 # ---------------------------------------------------------------------------
+
+def _chart_range():
+    end = date.today()
+    start = end - relativedelta(years=CHART_YEARS)
+    return start.isoformat(), end.isoformat()
+
 
 def _fetch_vegetation(lat, lon, start, end, cal):
     geom = point_buffer(lat, lon, 500)
@@ -149,10 +202,13 @@ def _fetch_vegetation(lat, lon, start, end, cal):
     cur  = col.filterDate(start, end)
     hist = col.filterDate(HIST_START, HIST_END).filter(
         ee.Filter.calendarRange(cal[0], cal[1], "month"))
+    cs, ce = _chart_range()
+    chart = col.filterDate(cs, ce)
     bands = ["NDVI", "EVI"]
     return {
-        "cur_series": extract_series(cur,  geom, 250, bands),
-        "hist_stats": extract_stats( hist, geom, 250, bands),
+        "cur_series":   extract_series(cur,   geom, 250, bands),
+        "hist_stats":   extract_stats( hist,  geom, 250, bands),
+        "chart_series": extract_series(chart, geom, 250, bands),
     }
 
 
@@ -162,10 +218,13 @@ def _fetch_optical(lat, lon, start, end, cal):
     cur   = col.filterDate(start, end)
     hist  = col.filterDate(HIST_START, HIST_END).filter(
         ee.Filter.calendarRange(cal[0], cal[1], "month"))
+    cs, ce = _chart_range()
+    chart = col.filterDate(cs, ce)
     bands = ["NDWI", "MNDWI", "SAVI", "NBR"]
     return {
-        "cur_series": extract_series(cur,  geom, 500, bands),
-        "hist_stats": extract_stats( hist, geom, 500, bands),
+        "cur_series":   extract_series(cur,   geom, 500, bands),
+        "hist_stats":   extract_stats( hist,  geom, 500, bands),
+        "chart_series": extract_series(chart, geom, 500, bands),
     }
 
 
@@ -175,25 +234,26 @@ def _fetch_lst(lat, lon, start, end, cal):
     cur  = col.filterDate(start, end)
     hist = col.filterDate(HIST_START, HIST_END).filter(
         ee.Filter.calendarRange(cal[0], cal[1], "month"))
+    cs, ce = _chart_range()
+    chart = col.filterDate(cs, ce)
     return {
-        "cur_series": extract_series(cur,  geom, 1000, ["LST"]),
-        "hist_stats": extract_stats( hist, geom, 1000, ["LST"]),
+        "cur_series":   extract_series(cur,   geom, 1000, ["LST"]),
+        "hist_stats":   extract_stats( hist,  geom, 1000, ["LST"]),
+        "chart_series": extract_series(chart, geom, 1000, ["LST"]),
     }
 
 
 def _fetch_precip(lat, lon, start, end, cal):
-    """CHIRPS daily precipitation: current total vs historical mean × days."""
+    """CHIRPS daily precipitation: current total vs 20-year historical mean × days."""
     geom = point_buffer(lat, lon, 5500)
     col  = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").select("precipitation")
 
-    # Current accumulated mm
     cur_sum = col.filterDate(start, end).sum()
     cur_raw = cur_sum.reduceRegion(
         reducer=ee.Reducer.mean(), geometry=geom, scale=5500, maxPixels=1e6
     ).getInfo()
     cur_mm = round(cur_raw.get("precipitation", 0) or 0, 1)
 
-    # Historical mean daily rate × days
     days     = (date.fromisoformat(end) - date.fromisoformat(start)).days or 1
     hist_col = col.filterDate(HIST_START, HIST_END).filter(
         ee.Filter.calendarRange(cal[0], cal[1], "month"))
@@ -206,8 +266,8 @@ def _fetch_precip(lat, lon, start, end, cal):
     hist_mean_daily = hist_raw.get("precipitation_mean") or 0
     hist_std_daily  = hist_raw.get("precipitation_stdDev") or 0
 
-    hist_mm = round(hist_mean_daily * days, 1)
-    hist_std_mm = round(hist_std_daily * days, 1)
+    hist_mm     = round(hist_mean_daily * days, 1)
+    hist_std_mm = round(hist_std_daily  * days, 1)
     z = _zscore(cur_mm, hist_mm, hist_std_mm)
 
     return {
@@ -222,21 +282,21 @@ def _fetch_precip(lat, lon, start, end, cal):
 
 
 # ---------------------------------------------------------------------------
-# Derived indices (no extra GEE calls)
+# Derived indices (computed from fetched data)
 # ---------------------------------------------------------------------------
 
-def _vci(ndvi_current, ndvi_hist_min, ndvi_hist_max):
-    denom = ndvi_hist_max - ndvi_hist_min
-    if denom == 0 or ndvi_current is None:
+def _vci(ndvi_cur, ndvi_hmin, ndvi_hmax):
+    denom = ndvi_hmax - ndvi_hmin
+    if denom == 0 or ndvi_cur is None:
         return None
-    return round(max(0.0, min(1.0, (ndvi_current - ndvi_hist_min) / denom)), 4)
+    return round(max(0.0, min(1.0, (ndvi_cur - ndvi_hmin) / denom)), 4)
 
 
-def _tci(lst_current, lst_hist_min, lst_hist_max):
-    denom = lst_hist_max - lst_hist_min
-    if denom == 0 or lst_current is None:
+def _tci(lst_cur, lst_hmin, lst_hmax):
+    denom = lst_hmax - lst_hmin
+    if denom == 0 or lst_cur is None:
         return None
-    return round(max(0.0, min(1.0, (lst_hist_max - lst_current) / denom)), 4)
+    return round(max(0.0, min(1.0, (lst_hmax - lst_cur) / denom)), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -368,9 +428,10 @@ def _socio(lat, lon, scale, idx: dict) -> dict:
         "water": water, "precipitation": precip_note, "thermal": thermal, "macro": macro,
         "causality_chain": causality,
         "assumptions": [
+            "Baseline histórico MODIS 2004-2024 (20 años, mismos meses calendario).",
             "Datos macroeconómicos son proxies estimados (INDEC/BCRA proyecciones 2025-2026).",
             "NDWI formula Gao 1996 (NIR-SWIR): sensible a humedad de canopeo.",
-            "VCI/TCI/VHI derivados del baseline histórico MODIS 2015-2024.",
+            "VCI/TCI/VHI derivados del baseline histórico MODIS 20 años.",
             "Precipitación acumulada fuente CHIRPS (resolución 5.5 km, ~5 días latencia).",
         ],
     }
@@ -416,7 +477,7 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
 
     logger.info("Analysis: (%.4f, %.4f) scale=%s %s→%s", lat, lon, scale_label, start, end)
 
-    # Parallel GEE fetches
+    # Parallel GEE fetches (cur + hist + chart series per collection)
     with ThreadPoolExecutor(max_workers=4) as pool:
         f_veg    = pool.submit(_fetch_vegetation, lat, lon, start, end, cal)
         f_opt    = pool.submit(_fetch_optical,    lat, lon, start, end, cal)
@@ -426,29 +487,42 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
             f_veg.result(), f_opt.result(), f_lst.result(), f_precip.result()
         )
 
-    # Summarize each index
-    ndvi = _summarize(veg_data["cur_series"]["NDVI"], veg_data["hist_stats"]["NDVI"], "ndvi", scale_label)
-    evi  = _summarize(veg_data["cur_series"]["EVI"],  veg_data["hist_stats"]["EVI"],  "evi",  scale_label)
-    savi = _summarize(opt_data["cur_series"]["SAVI"], opt_data["hist_stats"]["SAVI"], "savi", scale_label)
-    ndwi = _summarize(opt_data["cur_series"]["NDWI"], opt_data["hist_stats"]["NDWI"], "ndwi", scale_label)
-    mndwi= _summarize(opt_data["cur_series"]["MNDWI"],opt_data["hist_stats"]["MNDWI"],"mndwi",scale_label)
-    nbr  = _summarize(opt_data["cur_series"]["NBR"],  opt_data["hist_stats"]["NBR"],  "nbr",  scale_label)
-    lst  = _summarize(lst_data["cur_series"]["LST"],  lst_data["hist_stats"]["LST"],  "lst",  scale_label)
+    # Historical stats
+    ndvi_hist = veg_data["hist_stats"]["NDVI"]
+    evi_hist  = veg_data["hist_stats"]["EVI"]
+    savi_hist = opt_data["hist_stats"]["SAVI"]
+    ndwi_hist = opt_data["hist_stats"]["NDWI"]
+    mndwi_hist= opt_data["hist_stats"]["MNDWI"]
+    nbr_hist  = opt_data["hist_stats"]["NBR"]
+    lst_hist  = lst_data["hist_stats"]["LST"]
 
-    # Derived indices (no extra GEE calls)
-    vci_val = _vci(ndvi["current"], veg_data["hist_stats"]["NDVI"]["min"],
-                                    veg_data["hist_stats"]["NDVI"]["max"])
-    tci_val = _tci(lst["current"],  lst_data["hist_stats"]["LST"]["min"],
-                                    lst_data["hist_stats"]["LST"]["max"])
+    # Current + chart series for measured indices
+    ndvi = _summarize(veg_data["cur_series"]["NDVI"],  veg_data["chart_series"]["NDVI"],  ndvi_hist,  "ndvi",  scale_label)
+    evi  = _summarize(veg_data["cur_series"]["EVI"],   veg_data["chart_series"]["EVI"],   evi_hist,   "evi",   scale_label)
+    savi = _summarize(opt_data["cur_series"]["SAVI"],  opt_data["chart_series"]["SAVI"],  savi_hist,  "savi",  scale_label)
+    ndwi = _summarize(opt_data["cur_series"]["NDWI"],  opt_data["chart_series"]["NDWI"],  ndwi_hist,  "ndwi",  scale_label)
+    mndwi= _summarize(opt_data["cur_series"]["MNDWI"], opt_data["chart_series"]["MNDWI"], mndwi_hist, "mndwi", scale_label)
+    nbr  = _summarize(opt_data["cur_series"]["NBR"],   opt_data["chart_series"]["NBR"],   nbr_hist,   "nbr",   scale_label)
+    lst  = _summarize(lst_data["cur_series"]["LST"],   lst_data["chart_series"]["LST"],   lst_hist,   "lst",   scale_label)
+
+    # Derived scalar values
+    vci_val = _vci(ndvi["current"], ndvi_hist["min"], ndvi_hist["max"])
+    tci_val = _tci(lst["current"],  lst_hist["min"],  lst_hist["max"])
     vhi_val = round(0.5 * vci_val + 0.5 * tci_val, 4) if (vci_val and tci_val) else None
 
-    vci_hist = {"mean": 0.5, "std": 0.25, "min": 0.0, "max": 1.0, "count": 0}
-    tci_hist = {"mean": 0.5, "std": 0.25, "min": 0.0, "max": 1.0, "count": 0}
-    vhi_hist = {"mean": 0.5, "std": 0.20, "min": 0.0, "max": 1.0, "count": 0}
+    # Derived chart series (computed from already-fetched raw data)
+    vci_chart = _vci_series(veg_data["chart_series"]["NDVI"], ndvi_hist["min"], ndvi_hist["max"])
+    tci_chart = _tci_series(lst_data["chart_series"]["LST"],  lst_hist["min"],  lst_hist["max"])
+    vhi_chart = _vhi_series(vci_chart, tci_chart)
 
-    vci  = _summarize([], vci_hist, "vci",  scale_label, current_override=vci_val)
-    tci  = _summarize([], tci_hist, "tci",  scale_label, current_override=tci_val)
-    vhi  = _summarize([], vhi_hist, "vhi",  scale_label, current_override=vhi_val)
+    # Fixed theoretical hist for VCI/TCI/VHI (bounded [0,1])
+    vci_hist_meta = {"mean": 0.5, "std": 0.25, "min": 0.0, "max": 1.0, "count": 0}
+    tci_hist_meta = {"mean": 0.5, "std": 0.25, "min": 0.0, "max": 1.0, "count": 0}
+    vhi_hist_meta = {"mean": 0.5, "std": 0.20, "min": 0.0, "max": 1.0, "count": 0}
+
+    vci = _summarize([], vci_chart, vci_hist_meta, "vci", scale_label, current_override=vci_val)
+    tci = _summarize([], tci_chart, tci_hist_meta, "tci", scale_label, current_override=tci_val)
+    vhi = _summarize([], vhi_chart, vhi_hist_meta, "vhi", scale_label, current_override=vhi_val)
 
     indices = {
         "ndvi": ndvi, "evi": evi, "savi": savi,
@@ -466,6 +540,8 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
             "period_start": start, "period_end": end,
             "calendar_months": list(cal),
             "region": socio["region"], "season": socio["season"],
+            "hist_baseline": f"{HIST_START[:4]}–{HIST_END[:4]} (20 años)",
+            "chart_years": CHART_YEARS,
         },
         "indices":             indices,
         "situation_indicator": indicator,

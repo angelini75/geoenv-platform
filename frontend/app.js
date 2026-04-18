@@ -216,6 +216,7 @@ function renderDashboard(data) {
   renderCharts("charts-veg", [
     { key: "ndvi", label: "NDVI", candles: idx.ndvi.candlesticks, color: "#23d18b" },
     { key: "evi",  label: "EVI",  candles: idx.evi.candlesticks,  color: "#18c2b4" },
+    { key: "savi", label: "SAVI", candles: idx.savi.candlesticks, color: "#9b72f5" },
   ]);
 
   // Water & Drought
@@ -227,6 +228,7 @@ function renderDashboard(data) {
   renderCharts("charts-water", [
     { key: "ndwi",  label: "NDWI",  candles: idx.ndwi.candlesticks,  color: "#3b9eff" },
     { key: "mndwi", label: "MNDWI", candles: idx.mndwi.candlesticks, color: "#9b72f5" },
+    { key: "vci",   label: "VCI",   candles: idx.vci.candlesticks,   color: "#23d18b" },
   ]);
 
   // Thermal & Fire
@@ -236,6 +238,7 @@ function renderDashboard(data) {
     idxCard("NBR", idx.nbr, "Degradación / fuego");
   renderCharts("charts-thermal", [
     { key: "lst", label: "LST (°C)", candles: idx.lst.candlesticks, color: "#f07b3a" },
+    { key: "tci", label: "TCI",      candles: idx.tci.candlesticks, color: "#e5b93c" },
     { key: "nbr", label: "NBR",      candles: idx.nbr.candlesticks, color: "#e8425a" },
   ]);
 
@@ -287,76 +290,92 @@ function idxCard(name, d, desc, unit = "") {
   </div>`;
 }
 
-// ── Charts ───────────────────────────────────────────────────────
+// ── Charts (TradingView Lightweight Charts) ───────────────────────
+const _lwCharts = {};   // key → LightweightCharts instance (for cleanup)
+
 function renderCharts(containerId, series) {
+  const active = series.filter(s => s.candles && s.candles.length > 0);
   const container = document.getElementById(containerId);
-  container.innerHTML = series
-    .filter(s => s.candles && s.candles.length > 0)
-    .map(s => `
+  container.innerHTML = active.map(s => {
+    const first = s.candles[0]?.period?.slice(0, 7) ?? "";
+    const last  = s.candles[s.candles.length - 1]?.period?.slice(0, 7) ?? "";
+    return `
       <div class="chart-card">
         <div class="chart-header">
-          <span>${s.label} — Serie OHLC</span>
-          <span>${s.candles.length} período${s.candles.length !== 1 ? "s" : ""}</span>
+          <span>${s.label} — Velas mensuales</span>
+          <span>${first} → ${last} · ${s.candles.length} meses</span>
         </div>
         <div class="chart-wrap" id="chart-${s.key}"></div>
-      </div>`)
-    .join("");
+      </div>`;
+  }).join("");
 
-  // Render after DOM insertion
   requestAnimationFrame(() => {
-    series.forEach(s => {
-      if (s.candles && s.candles.length > 0) plotCandle(s.key, s.candles, s.color);
-    });
+    active.forEach(s => plotCandleLW(s.key, s.candles, s.color));
   });
 }
 
-function plotCandle(key, candles, color) {
+function plotCandleLW(key, candles, accentColor) {
   const el = document.getElementById(`chart-${key}`);
-  if (!el) return;
+  if (!el || !candles.length) return;
 
-  const dates  = candles.map(c => c.period);
-  const opens  = candles.map(c => c.open);
-  const highs  = candles.map(c => c.high);
-  const lows   = candles.map(c => c.low);
-  const closes = candles.map(c => c.close);
-  const texts  = candles.map(c =>
-    `<b>${c.period}</b><br>O:${c.open}  H:${c.high}  L:${c.low}  C:${c.close}<br>${c.direction}<br>${c.anomaly_class} (z=${c.z_close ?? "N/D"})`
-  );
+  // Destroy previous instance
+  if (_lwCharts[key]) { try { _lwCharts[key].remove(); } catch (_) {} }
+  el.innerHTML = "";
 
-  const candleTrace = {
-    type: "candlestick",
-    x: dates, open: opens, high: highs, low: lows, close: closes,
-    text: texts, hoverinfo: "text",
-    increasing: { line: { color: "#23d18b" }, fillcolor: "rgba(35,209,139,.55)" },
-    decreasing: { line: { color: "#e8425a" }, fillcolor: "rgba(232,66,90,.55)" },
-    name: key.toUpperCase(),
-  };
+  const chart = LightweightCharts.createChart(el, {
+    layout: {
+      background: { type: "solid", color: "#0e1520" },
+      textColor: "#7a90aa",
+      fontSize: 10,
+    },
+    grid: {
+      vertLines: { color: "#1c2d42", style: 1 },
+      horzLines: { color: "#1c2d42", style: 1 },
+    },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: "#243650", scaleMargins: { top: 0.08, bottom: 0.08 } },
+    timeScale: { borderColor: "#243650", fixLeftEdge: true, fixRightEdge: true },
+    width:  el.clientWidth  || 400,
+    height: el.clientHeight || 230,
+  });
+  _lwCharts[key] = chart;
 
-  // Normalised z-score overlay
-  const zVals = candles.map(c => c.z_close).filter(z => z !== null);
-  const traces = [candleTrace];
-  if (zVals.length > 0) {
-    const range  = Math.max(...highs) - Math.min(...lows) || 0.01;
-    const mid    = (Math.max(...highs) + Math.min(...lows)) / 2;
-    const zNorm  = candles.map(c => c.z_close !== null ? mid + (c.z_close / 3) * range * 0.38 : null);
-    traces.push({
-      type: "scatter", x: dates, y: zNorm,
-      mode: "lines+markers",
-      line: { color, width: 1.8, dash: "dot" },
-      marker: { size: 4, color },
-      name: "Z-score", hoverinfo: "skip",
-    });
-  }
+  // Auto-resize
+  new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth })).observe(el);
 
-  Plotly.react(el, traces, {
-    paper_bgcolor: "transparent", plot_bgcolor: "transparent",
-    margin: { t: 6, r: 12, b: 30, l: 52 },
-    xaxis: { color: "#7a90aa", gridcolor: "#1c2d42", tickfont: { size: 9 }, rangeslider: { visible: false } },
-    yaxis: { color: "#7a90aa", gridcolor: "#1c2d42", tickfont: { size: 9 } },
-    legend: { font: { color: "#7a90aa", size: 9 }, bgcolor: "transparent" },
-    showlegend: zVals.length > 0,
-    font: { color: "#c8d8ec" },
-  }, { displayModeBar: false, responsive: true });
+  const series = chart.addCandlestickSeries({
+    upColor:        "#23d18b",
+    downColor:      "#e8425a",
+    borderUpColor:  "#23d18b",
+    borderDownColor:"#e8425a",
+    wickUpColor:    "#23d18b",
+    wickDownColor:  "#e8425a",
+  });
+
+  series.setData(candles.map(c => ({
+    time:  c.period,   // "YYYY-MM-DD" — first day of each month
+    open:  c.open,
+    high:  c.high,
+    low:   c.low,
+    close: c.close,
+  })));
+
+  // Anomaly markers (z ≥ 1.5σ)
+  const markers = candles
+    .filter(c => c.z_close !== null && Math.abs(c.z_close) >= 1.5)
+    .map(c => ({
+      time:     c.period,
+      position: c.z_close > 0 ? "aboveBar" : "belowBar",
+      color:    Math.abs(c.z_close) >= 2.5 ? "#e8425a" : "#e5b93c",
+      shape:    "circle",
+      size:     1,
+      text:     `z ${c.z_close > 0 ? "+" : ""}${c.z_close.toFixed(1)}σ`,
+    }))
+    .sort((a, b) => a.time.localeCompare(b.time));
+
+  if (markers.length) series.setMarkers(markers);
+
+  chart.timeScale().fitContent();
 }
 
 // ── Precipitation card ───────────────────────────────────────────
