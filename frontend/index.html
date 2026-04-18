@@ -4,61 +4,154 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>GeoEnv — Indicadores Ambientales Argentina</title>
+
+  <!-- Performance: preconnect to external resources -->
+  <link rel="preconnect" href="https://server.arcgisonline.com">
+  <link rel="preconnect" href="https://services.arcgisonline.com">
+  <link rel="preconnect" href="https://unpkg.com">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <link rel="stylesheet" href="/static/style.css"/>
 </head>
 <body>
-<div class="layout">
 
-  <header>
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2">
-      <circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+<!-- ═══ HEADER ═══ -->
+<header class="header" role="banner">
+  <div class="header-logo">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#3b9eff" stroke-width="2" aria-hidden="true">
+      <circle cx="12" cy="12" r="10"/>
+      <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
     </svg>
-    <span class="logo">GeoEnv Platform</span>
-    <span class="subtitle">Diagnóstico ambiental — Argentina · MODIS / GEE</span>
-  </header>
+    <div>
+      <div class="logo-text">GeoEnv Platform</div>
+      <div class="logo-sub">Argentina · MODIS · CHIRPS · GEE</div>
+    </div>
+  </div>
+  <div class="header-spacer"></div>
+  <div class="header-chip" id="header-chip" aria-live="polite"></div>
+</header>
 
-  <div class="body">
-    <div id="map"></div>
+<!-- ═══ WORKSPACE (map + controls) ═══ -->
+<div class="workspace" role="main">
 
-    <div id="panel">
-      <div class="panel-controls">
+  <div id="map" role="application" aria-label="Mapa interactivo de Argentina — haga clic para seleccionar un punto de análisis"></div>
 
-        <div class="coords-box" id="coords-box">
+  <!-- Control panel -->
+  <aside class="ctrl-panel" aria-label="Panel de control">
+    <div class="ctrl-inner">
+
+      <div>
+        <div class="field-label" id="coords-label">Punto seleccionado</div>
+        <div class="coords-display" id="coords-display" role="status" aria-labelledby="coords-label">
           Haga clic en el mapa para seleccionar un punto
         </div>
-
-        <div class="scale-label">Ventana temporal</div>
-        <div class="scale-grid" id="scale-grid">
-          <button class="scale-btn" data-scale="1w">1s</button>
-          <button class="scale-btn" data-scale="2w">2s</button>
-          <button class="scale-btn active" data-scale="1m">1m</button>
-          <button class="scale-btn" data-scale="2m">2m</button>
-          <button class="scale-btn" data-scale="3m">3m</button>
-          <button class="scale-btn" data-scale="6m">6m</button>
-          <button class="scale-btn" data-scale="1y">1a</button>
-        </div>
-
-        <button id="btn-analyze" disabled>
-          Analizar punto
-        </button>
       </div>
 
-      <div id="results">
-        <div class="placeholder">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>
-          </svg>
-          <p>Seleccione un punto en Argentina<br>y haga clic en <strong>Analizar</strong></p>
+      <div>
+        <div class="field-label" id="scale-label">Ventana temporal</div>
+        <div class="scale-row" role="group" aria-labelledby="scale-label">
+          <button class="scale-btn" data-scale="1w" aria-pressed="false">1s</button>
+          <button class="scale-btn" data-scale="2w" aria-pressed="false">2s</button>
+          <button class="scale-btn active" data-scale="1m" aria-pressed="true">1m</button>
+          <button class="scale-btn" data-scale="2m" aria-pressed="false">2m</button>
+          <button class="scale-btn" data-scale="3m" aria-pressed="false">3m</button>
+          <button class="scale-btn" data-scale="6m" aria-pressed="false">6m</button>
+          <button class="scale-btn" data-scale="1y" aria-pressed="false">1a</button>
         </div>
       </div>
-    </div><!-- #panel -->
+
+      <button class="btn-analyze" id="btn-analyze" disabled
+              aria-label="Iniciar análisis ambiental del punto seleccionado">
+        Analizar punto
+      </button>
+
+    </div>
+  </aside>
+</div>
+
+<!-- ═══ DASHBOARD (scrollable, hidden until analysis runs) ═══ -->
+<section id="dashboard" aria-live="polite" aria-label="Resultados del análisis ambiental">
+
+  <!-- Situation banner -->
+  <div class="sit-banner" id="sit-banner"></div>
+
+  <!-- Vegetation -->
+  <div class="idx-section">
+    <div class="idx-section-header">
+      <span class="idx-section-icon" aria-hidden="true">🌱</span>
+      <span class="idx-section-title">Vegetación</span>
+      <span class="idx-section-sub">NDVI · EVI · SAVI — MODIS MOD13Q1 / MOD09A1 · 250–500 m</span>
+    </div>
+    <div class="idx-grid" id="grid-veg"></div>
+  </div>
+  <div class="chart-section" id="charts-veg"></div>
+
+  <!-- Water & Drought -->
+  <div class="idx-section">
+    <div class="idx-section-header">
+      <span class="idx-section-icon" aria-hidden="true">💧</span>
+      <span class="idx-section-title">Agua &amp; Sequía</span>
+      <span class="idx-section-sub">NDWI · MNDWI · VCI · VHI — MODIS MOD09A1 / MOD13Q1</span>
+    </div>
+    <div class="idx-grid" id="grid-water"></div>
+  </div>
+  <div class="chart-section" id="charts-water"></div>
+
+  <!-- Thermal & Fire -->
+  <div class="idx-section">
+    <div class="idx-section-header">
+      <span class="idx-section-icon" aria-hidden="true">🌡️</span>
+      <span class="idx-section-title">Temperatura &amp; Fuego</span>
+      <span class="idx-section-sub">LST · TCI · NBR — MODIS MOD11A2 / MOD09A1 · 500–1000 m</span>
+    </div>
+    <div class="idx-grid" id="grid-thermal"></div>
+  </div>
+  <div class="chart-section" id="charts-thermal"></div>
+
+  <!-- Precipitation -->
+  <div class="idx-section">
+    <div class="idx-section-header">
+      <span class="idx-section-icon" aria-hidden="true">🌧️</span>
+      <span class="idx-section-title">Precipitación</span>
+      <span class="idx-section-sub">CHIRPS · resolución 5.5 km · latencia ~5 días</span>
+    </div>
+    <div id="precip-card"></div>
   </div>
 
-</div><!-- .layout -->
+  <div class="section-sep"></div>
 
+  <!-- Socioeconomic context -->
+  <div class="socio-section" id="socio-section"></div>
+
+  <!-- AI Report -->
+  <div class="report-section">
+    <div class="report-header">
+      <div>
+        <div class="report-title">
+          <span aria-hidden="true">📄</span> Informe IA
+        </div>
+        <div class="report-sub">Claude genera un análisis narrativo de 1–2 páginas</div>
+      </div>
+      <button class="btn-report" id="btn-report" disabled
+              aria-label="Generar informe narrativo con inteligencia artificial">
+        Generar Informe
+      </button>
+    </div>
+    <div class="report-body" id="report-body" aria-live="polite">
+      <span style="color:var(--text-dim);font-size:.77rem">
+        El informe se generará aquí tras hacer clic en "Generar Informe".
+      </span>
+    </div>
+  </div>
+
+</section><!-- #dashboard -->
+
+<!-- Scripts -->
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

@@ -8,6 +8,7 @@ services:
     environment:
       - GOOGLE_APPLICATION_CREDENTIALS=/app/secrets/credentials.json
       - GEE_PROJECT=ee-angelini75
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     volumes:
       # Mount the shared service-account key from the parent stack
       - /opt/mi-stack/secrets:/app/secrets:ro

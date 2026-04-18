@@ -1,28 +1,28 @@
 """
-Environmental indices computation and diagnostic engine.
+Environmental analysis engine — Argentina.
 
 Data sources:
-  NDVI / EVI : MODIS/061/MOD13Q1  (16-day, 250 m)
-  NDWI       : MODIS/061/MOD09A1  (8-day, 500 m)  — Gao 1996 formulation
-  LST        : MODIS/061/MOD11A2  (8-day, 1 km)
+  MOD13Q1  : NDVI, EVI            (16-day, 250 m)
+  MOD09A1  : NDWI, MNDWI, SAVI, NBR (8-day, 500 m)
+  MOD11A2  : LST                  (8-day, 1 km)
+  CHIRPS   : Precipitation         (daily, 5.5 km)
 
-Historical baseline: same calendar months, 2015-2024 (10 years).
+Derived: VCI, TCI, VHI  (from NDVI + LST historical min/max)
+Historical baseline: 2015-2024, same calendar months.
+GEE fetches run in parallel threads to minimize latency.
 """
 import ee
 import math
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
 from collections import defaultdict
 
 from gee_client import (
     point_buffer,
-    scale_modis_ndvi,
-    scale_modis_surf_refl,
-    scale_modis_lst,
-    add_ndwi_band,
-    extract_series,
-    extract_stats,
+    scale_mod13q1, scale_mod09a1, scale_mod11a2,
+    extract_series, extract_stats,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,214 +31,219 @@ SCALE_DAYS = {
     "1w": 7, "2w": 14, "1m": 30, "2m": 60,
     "3m": 90, "6m": 180, "1y": 365,
 }
-
-HISTORICAL_START = "2015-01-01"
-HISTORICAL_END   = "2024-12-31"
-
-# MODIS native pixel sizes
-RES = {"ndvi": 250, "evi": 250, "ndwi": 500, "lst": 1000}
+HIST_START = "2015-01-01"
+HIST_END   = "2024-12-31"
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def zscore(value: float, mean: float, std: float) -> float | None:
-    if std == 0 or std is None:
+def _zscore(value, mean, std):
+    if std == 0 or std is None or value is None:
         return None
     return round((value - mean) / std, 3)
 
 
-def pct_deviation(value: float, mean: float) -> float | None:
-    if mean == 0 or mean is None:
+def _pct_dev(value, mean):
+    if mean == 0 or mean is None or value is None:
         return None
     return round((value - mean) / abs(mean) * 100, 2)
 
 
-def classify_anomaly(z: float | None, index: str) -> str:
+def _classify(z) -> str:
     if z is None:
         return "Sin datos"
-    az = abs(z)
-    if az < 1.0:
+    a = abs(z)
+    if a < 1.0:
         return "Normal"
-    if az < 1.5:
+    if a < 1.5:
         return "Anomalía moderada"
     return "Anomalía extrema"
 
 
-def candlestick_direction(index: str, open_v: float, close_v: float) -> str:
-    """Interpret bullish/bearish direction per index semantics."""
-    if close_v > open_v:
-        if index in ("ndvi", "evi"):
-            return "Alcista (recuperación)"
-        if index == "ndwi":
-            return "Alcista (recarga hídrica)"
-        if index == "lst":
-            return "Alcista (estrés térmico)"
-    elif close_v < open_v:
-        if index in ("ndvi", "evi"):
-            return "Bajista (estrés/degradación)"
-        if index == "ndwi":
-            return "Bajista (déficit hídrico)"
-        if index == "lst":
-            return "Bajista (enfriamiento)"
-    return "Neutro"
-
-
-def build_candlesticks(series: list[dict], hist_mean: float, hist_std: float, index: str, scale_label: str) -> list[dict]:
-    """
-    Group time series into monthly (or weekly for ≤2w) periods and compute OHLC.
-    """
-    if not series:
-        return []
-
-    days = SCALE_DAYS.get(scale_label, 30)
-    group_by = "week" if days <= 14 else "month"
-
-    def period_key(date_str: str) -> str:
-        d = date.fromisoformat(date_str)
-        if group_by == "week":
-            iso = d.isocalendar()
-            return f"{iso[0]}-W{iso[1]:02d}"
-        return date_str[:7]  # YYYY-MM
-
-    groups: dict[str, list[float]] = defaultdict(list)
-    for pt in series:
-        groups[period_key(pt["date"])].append(pt["value"])
-
-    candles = []
-    for period in sorted(groups):
-        vals = groups[period]
-        if not vals:
-            continue
-        o = vals[0]
-        c = vals[-1]
-        h = max(vals)
-        lo = min(vals)
-        z = zscore(c, hist_mean, hist_std)
-        candles.append({
-            "period": period,
-            "open": round(o, 5),
-            "close": round(c, 5),
-            "high": round(h, 5),
-            "low": round(lo, 5),
-            "range": round(h - lo, 5),
-            "direction": candlestick_direction(index, o, c),
-            "z_close": z,
-            "anomaly_class": classify_anomaly(z, index),
-            "n_observations": len(vals),
-        })
-    return candles
-
-
-# ---------------------------------------------------------------------------
-# Per-index data fetch
-# ---------------------------------------------------------------------------
-
-def _calendar_months(start_date: date, end_date: date) -> tuple[int, int]:
+def _calendar_months(start: date, end: date) -> tuple[int, int]:
     months = set()
-    cur = start_date.replace(day=1)
-    while cur <= end_date:
+    cur = start.replace(day=1)
+    while cur <= end:
         months.add(cur.month)
         cur += relativedelta(months=1)
     months = sorted(months)
     return months[0], months[-1]
 
 
-def fetch_ndvi_evi(lat: float, lon: float, start: str, end: str, cal_months: tuple[int, int]) -> dict:
-    geom250 = point_buffer(lat, lon, 500)
-
-    col = ee.ImageCollection("MODIS/061/MOD13Q1").map(scale_modis_ndvi)
-    cur_col = col.filterDate(start, end)
-    hist_col = (
-        col.filterDate(HISTORICAL_START, HISTORICAL_END)
-        .filter(ee.Filter.calendarRange(cal_months[0], cal_months[1], "month"))
-    )
-
-    ndvi_series = extract_series(cur_col, geom250, 250, "NDVI")
-    evi_series  = extract_series(cur_col, geom250, 250, "EVI")
-    ndvi_hist   = extract_stats(hist_col, geom250, 250, "NDVI")
-    evi_hist    = extract_stats(hist_col, geom250, 250, "EVI")
-
-    return {
-        "ndvi": {"series": ndvi_series, "hist": ndvi_hist},
-        "evi":  {"series": evi_series,  "hist": evi_hist},
-    }
+def _direction(index: str, o: float, c: float) -> str:
+    if c > o:
+        labels = {"ndvi": "Alcista (recuperación)", "evi": "Alcista (recuperación)",
+                  "savi": "Alcista (recuperación)", "ndwi": "Alcista (recarga hídrica)",
+                  "mndwi": "Alcista (agua superficial +)", "vci": "Alcista (condición vegetal +)",
+                  "vhi": "Alcista (salud ecosistema +)", "lst": "Alcista (estrés térmico)",
+                  "tci": "Alcista (condición térmica +)", "nbr": "Alcista (biomasa +)"}
+        return labels.get(index, "Alcista")
+    elif c < o:
+        labels = {"ndvi": "Bajista (estrés/degradación)", "evi": "Bajista (estrés/degradación)",
+                  "savi": "Bajista (suelo expuesto +)", "ndwi": "Bajista (déficit hídrico)",
+                  "mndwi": "Bajista (agua superficial −)", "vci": "Bajista (sequía agrícola)",
+                  "vhi": "Bajista (deterioro ecosistema)", "lst": "Bajista (enfriamiento)",
+                  "tci": "Bajista (estrés térmico +)", "nbr": "Bajista (degradación/fuego)"}
+        return labels.get(index, "Bajista")
+    return "Neutro"
 
 
-def fetch_ndwi(lat: float, lon: float, start: str, end: str, cal_months: tuple[int, int]) -> dict:
-    geom500 = point_buffer(lat, lon, 1000)
-
-    col = (
-        ee.ImageCollection("MODIS/061/MOD09A1")
-        .map(scale_modis_surf_refl)
-        .map(add_ndwi_band)
-        .select(["NDWI"])
-    )
-    cur_col  = col.filterDate(start, end)
-    hist_col = (
-        col.filterDate(HISTORICAL_START, HISTORICAL_END)
-        .filter(ee.Filter.calendarRange(cal_months[0], cal_months[1], "month"))
-    )
-
-    series = extract_series(cur_col, geom500, 500, "NDWI")
-    hist   = extract_stats(hist_col, geom500, 500, "NDWI")
-
-    return {"series": series, "hist": hist}
-
-
-def fetch_lst(lat: float, lon: float, start: str, end: str, cal_months: tuple[int, int]) -> dict:
-    geom1k = point_buffer(lat, lon, 2000)
-
-    col = ee.ImageCollection("MODIS/061/MOD11A2").map(scale_modis_lst).select(["LST"])
-    cur_col  = col.filterDate(start, end)
-    hist_col = (
-        col.filterDate(HISTORICAL_START, HISTORICAL_END)
-        .filter(ee.Filter.calendarRange(cal_months[0], cal_months[1], "month"))
-    )
-
-    series = extract_series(cur_col, geom1k, 1000, "LST")
-    hist   = extract_stats(hist_col, geom1k, 1000, "LST")
-
-    return {"series": series, "hist": hist}
-
-
-# ---------------------------------------------------------------------------
-# Summarize a single index
-# ---------------------------------------------------------------------------
-
-def summarize_index(series: list[dict], hist: dict, index: str, scale_label: str) -> dict:
+def _build_candlesticks(series: list[dict], hist_mean: float, hist_std: float,
+                        index: str, scale: str) -> list[dict]:
     if not series:
-        return {
-            "current": None, "hist_mean": hist["mean"], "hist_std": hist["std"],
-            "z_score": None, "pct_deviation": None, "anomaly_class": "Sin datos",
-            "candlesticks": [], "hist_n_images": hist["count"],
-        }
+        return []
+    group = "week" if SCALE_DAYS.get(scale, 30) <= 14 else "month"
 
-    current_val = series[-1]["value"]
-    z = zscore(current_val, hist["mean"], hist["std"])
-    pct = pct_deviation(current_val, hist["mean"])
-    candles = build_candlesticks(series, hist["mean"], hist["std"], index, scale_label)
+    def key(d):
+        dt = date.fromisoformat(d)
+        return f"{dt.isocalendar()[0]}-W{dt.isocalendar()[1]:02d}" if group == "week" else d[:7]
 
+    groups: dict[str, list] = defaultdict(list)
+    for pt in series:
+        groups[key(pt["date"])].append(pt["value"])
+
+    out = []
+    for period in sorted(groups):
+        vals = groups[period]
+        if not vals:
+            continue
+        o, c, h, lo = vals[0], vals[-1], max(vals), min(vals)
+        z = _zscore(c, hist_mean, hist_std)
+        out.append({
+            "period": period, "open": round(o, 5), "close": round(c, 5),
+            "high": round(h, 5), "low": round(lo, 5), "range": round(h - lo, 5),
+            "direction": _direction(index, o, c), "z_close": z,
+            "anomaly_class": _classify(z), "n_observations": len(vals),
+        })
+    return out
+
+
+def _summarize(series: list[dict], hist: dict, index: str, scale: str,
+               current_override=None) -> dict:
+    val = current_override if current_override is not None else (series[-1]["value"] if series else None)
+    z   = _zscore(val, hist["mean"], hist["std"])
     return {
-        "current": round(current_val, 5),
-        "hist_mean": hist["mean"],
-        "hist_std": hist["std"],
-        "z_score": z,
-        "pct_deviation": pct,
-        "anomaly_class": classify_anomaly(z, index),
-        "candlesticks": candles,
-        "hist_n_images": hist["count"],
+        "current":        round(val, 5) if val is not None else None,
+        "hist_mean":      hist["mean"],
+        "hist_std":       hist["std"],
+        "hist_min":       hist.get("min"),
+        "hist_max":       hist.get("max"),
+        "z_score":        z,
+        "pct_deviation":  _pct_dev(val, hist["mean"]),
+        "anomaly_class":  _classify(z),
+        "candlesticks":   _build_candlesticks(series, hist["mean"], hist["std"], index, scale),
         "n_observations": len(series),
+        "hist_n_images":  hist["count"],
     }
 
 
 # ---------------------------------------------------------------------------
-# Situation indicator
+# GEE fetch functions (run in parallel)
 # ---------------------------------------------------------------------------
 
-ARGENTINA_REGION_MAP = {
-    # (lat_min, lat_max, lon_min, lon_max): region_name
+def _fetch_vegetation(lat, lon, start, end, cal):
+    geom = point_buffer(lat, lon, 500)
+    col  = ee.ImageCollection("MODIS/061/MOD13Q1").map(scale_mod13q1)
+    cur  = col.filterDate(start, end)
+    hist = col.filterDate(HIST_START, HIST_END).filter(
+        ee.Filter.calendarRange(cal[0], cal[1], "month"))
+    bands = ["NDVI", "EVI"]
+    return {
+        "cur_series": extract_series(cur,  geom, 250, bands),
+        "hist_stats": extract_stats( hist, geom, 250, bands),
+    }
+
+
+def _fetch_optical(lat, lon, start, end, cal):
+    geom  = point_buffer(lat, lon, 1000)
+    col   = ee.ImageCollection("MODIS/061/MOD09A1").map(scale_mod09a1)
+    cur   = col.filterDate(start, end)
+    hist  = col.filterDate(HIST_START, HIST_END).filter(
+        ee.Filter.calendarRange(cal[0], cal[1], "month"))
+    bands = ["NDWI", "MNDWI", "SAVI", "NBR"]
+    return {
+        "cur_series": extract_series(cur,  geom, 500, bands),
+        "hist_stats": extract_stats( hist, geom, 500, bands),
+    }
+
+
+def _fetch_lst(lat, lon, start, end, cal):
+    geom = point_buffer(lat, lon, 2000)
+    col  = ee.ImageCollection("MODIS/061/MOD11A2").map(scale_mod11a2)
+    cur  = col.filterDate(start, end)
+    hist = col.filterDate(HIST_START, HIST_END).filter(
+        ee.Filter.calendarRange(cal[0], cal[1], "month"))
+    return {
+        "cur_series": extract_series(cur,  geom, 1000, ["LST"]),
+        "hist_stats": extract_stats( hist, geom, 1000, ["LST"]),
+    }
+
+
+def _fetch_precip(lat, lon, start, end, cal):
+    """CHIRPS daily precipitation: current total vs historical mean × days."""
+    geom = point_buffer(lat, lon, 5500)
+    col  = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").select("precipitation")
+
+    # Current accumulated mm
+    cur_sum = col.filterDate(start, end).sum()
+    cur_raw = cur_sum.reduceRegion(
+        reducer=ee.Reducer.mean(), geometry=geom, scale=5500, maxPixels=1e6
+    ).getInfo()
+    cur_mm = round(cur_raw.get("precipitation", 0) or 0, 1)
+
+    # Historical mean daily rate × days
+    days     = (date.fromisoformat(end) - date.fromisoformat(start)).days or 1
+    hist_col = col.filterDate(HIST_START, HIST_END).filter(
+        ee.Filter.calendarRange(cal[0], cal[1], "month"))
+    hist_img = hist_col.reduce(
+        ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True)
+    )
+    hist_raw = hist_img.reduceRegion(
+        reducer=ee.Reducer.mean(), geometry=geom, scale=5500, maxPixels=1e6
+    ).getInfo()
+    hist_mean_daily = hist_raw.get("precipitation_mean") or 0
+    hist_std_daily  = hist_raw.get("precipitation_stdDev") or 0
+
+    hist_mm = round(hist_mean_daily * days, 1)
+    hist_std_mm = round(hist_std_daily * days, 1)
+    z = _zscore(cur_mm, hist_mm, hist_std_mm)
+
+    return {
+        "current_mm":    cur_mm,
+        "hist_mean_mm":  hist_mm,
+        "hist_std_mm":   hist_std_mm,
+        "z_score":       z,
+        "pct_deviation": _pct_dev(cur_mm, hist_mm),
+        "anomaly_class": _classify(z),
+        "analysis_days": days,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Derived indices (no extra GEE calls)
+# ---------------------------------------------------------------------------
+
+def _vci(ndvi_current, ndvi_hist_min, ndvi_hist_max):
+    denom = ndvi_hist_max - ndvi_hist_min
+    if denom == 0 or ndvi_current is None:
+        return None
+    return round(max(0.0, min(1.0, (ndvi_current - ndvi_hist_min) / denom)), 4)
+
+
+def _tci(lst_current, lst_hist_min, lst_hist_max):
+    denom = lst_hist_max - lst_hist_min
+    if denom == 0 or lst_current is None:
+        return None
+    return round(max(0.0, min(1.0, (lst_hist_max - lst_current) / denom)), 4)
+
+
+# ---------------------------------------------------------------------------
+# Region / season helpers
+# ---------------------------------------------------------------------------
+
+_REGIONS = {
     (-34, -22, -64, -53): "NEA/NOA",
     (-38, -30, -65, -57): "Pampas",
     (-45, -38, -72, -65): "Patagonia Norte",
@@ -246,40 +251,39 @@ ARGENTINA_REGION_MAP = {
     (-34, -28, -70, -64): "Cuyo",
 }
 
-def detect_region(lat: float, lon: float) -> str:
-    for (lat_min, lat_max, lon_min, lon_max), name in ARGENTINA_REGION_MAP.items():
+
+def _region(lat, lon):
+    for (lat_min, lat_max, lon_min, lon_max), name in _REGIONS.items():
         if lat_min <= lat <= lat_max and lon_min <= lon <= lon_max:
             return name
     return "Argentina"
 
 
-def situation_indicator(ndvi_sum: dict, ndwi_sum: dict, evi_sum: dict, lst_sum: dict) -> str:
-    zs = [
-        ndvi_sum.get("z_score"),
-        ndwi_sum.get("z_score"),
-        evi_sum.get("z_score"),
-        lst_sum.get("z_score"),
-    ]
-    zs = [z for z in zs if z is not None]
-    if not zs:
-        return "INDETERMINADO"
+def _season(month):
+    return ("Verano" if month in (12, 1, 2)
+            else "Otoño" if month in (3, 4, 5)
+            else "Invierno" if month in (6, 7, 8)
+            else "Primavera")
 
-    ndvi_z = ndvi_sum.get("z_score") or 0
-    ndwi_z = ndwi_sum.get("z_score") or 0
-    lst_z  = lst_sum.get("z_score") or 0
 
-    # Critical: severe vegetation collapse, extreme heat+water stress, or extreme cold snap
-    if ndvi_z < -2.0 or (ndwi_z < -1.5 and lst_z > 1.5) or lst_z < -2.5:
+# ---------------------------------------------------------------------------
+# Situation indicator
+# ---------------------------------------------------------------------------
+
+def _situation(idx: dict) -> str:
+    ndvi_z = idx["ndvi"]["z_score"] or 0
+    ndwi_z = idx["ndwi"]["z_score"] or 0
+    lst_z  = idx["lst"]["z_score"]  or 0
+    vhi    = idx["vhi"]["current"]
+
+    if ndvi_z < -2.0 or (ndwi_z < -1.5 and lst_z > 1.5) or lst_z < -2.5 or lst_z > 3.0:
         return "CRÍTICO"
-
-    # Alert: heat stress, cold anomaly, or vegetation/water stress
-    if ndvi_z < -1.5 or ndwi_z < -1.5 or lst_z > 2.0 or lst_z < -2.0:
+    if ndvi_z < -1.5 or ndwi_z < -1.5 or lst_z > 2.0 or lst_z < -2.0 or (vhi is not None and vhi < 0.2):
         return "ALERTA"
     if abs(ndvi_z) < 0.5 and abs(ndwi_z) < 0.5 and abs(lst_z) < 0.5:
         return "FAVORABLE"
     if ndvi_z > 1.0 and ndwi_z > 0.5:
         return "FAVORABLE"
-
     return "NORMAL"
 
 
@@ -287,141 +291,115 @@ def situation_indicator(ndvi_sum: dict, ndwi_sum: dict, evi_sum: dict, lst_sum: 
 # Socioeconomic context
 # ---------------------------------------------------------------------------
 
-def socioeconomic_context(lat: float, lon: float, scale_label: str,
-                          ndvi_sum: dict, ndwi_sum: dict, lst_sum: dict) -> dict:
-    region = detect_region(lat, lon)
-    today  = date.today()
-    month  = today.month
+def _socio(lat, lon, scale, idx: dict) -> dict:
+    region  = _region(lat, lon)
+    season  = _season(date.today().month)
+    ndvi_z  = idx["ndvi"]["z_score"] or 0
+    ndwi_z  = idx["ndwi"]["z_score"] or 0
+    lst_z   = idx["lst"]["z_score"]  or 0
+    precip  = idx["precipitation"]
 
-    # Season (Southern Hemisphere)
-    season = ("Verano" if month in (12, 1, 2)
-               else "Otoño" if month in (3, 4, 5)
-               else "Invierno" if month in (6, 7, 8)
-               else "Primavera")
-
-    ndvi_z = ndvi_sum.get("z_score") or 0
-    ndwi_z = ndwi_sum.get("z_score") or 0
-    lst_z  = lst_sum.get("z_score") or 0
-
-    # --- Agriculture ---
+    # Agriculture
     if ndvi_z < -1.0:
-        ag_assessment = (
-            f"Condición vegetal deteriorada (z={ndvi_z:.2f}). Riesgo de reducción "
-            f"de rendimientos en cultivos de la región {region}. "
-            f"{'Estrés hídrico adicional detectado.' if ndwi_z < -1.0 else ''}"
-        )
+        ag = (f"Condición vegetal deteriorada (NDVI z={ndvi_z:.2f}). Riesgo de reducción de "
+              f"rendimientos en {region}." + (" Déficit hídrico adicional." if ndwi_z < -1.0 else ""))
         yield_impact = "Negativo"
     elif ndvi_z > 1.0:
-        ag_assessment = (
-            f"Biomasa superior al promedio histórico (z={ndvi_z:.2f}). "
-            f"Condiciones favorables para cultivos en {region}."
-        )
+        ag = f"Biomasa superior al promedio histórico (NDVI z=+{ndvi_z:.2f}). Condiciones favorables en {region}."
         yield_impact = "Positivo"
     else:
-        ag_assessment = f"Condición vegetal dentro del rango histórico normal en {region}."
+        ag = f"Condición vegetal dentro del rango histórico normal en {region}."
         yield_impact = "Neutro"
 
-    # --- Water stress ---
+    # Water
     if ndwi_z < -1.5:
-        water_note = "Déficit hídrico severo. Posible necesidad de riego suplementario."
+        water = "Déficit hídrico severo. Probable necesidad de riego suplementario."
     elif ndwi_z < -0.5:
-        water_note = "Estrés hídrico moderado. Monitoreo de reservas recomendado."
+        water = "Estrés hídrico moderado. Monitoreo de reservas recomendado."
     else:
-        water_note = "Disponibilidad hídrica dentro de parámetros normales."
+        water = "Disponibilidad hídrica dentro de parámetros normales."
 
-    # --- Thermal context ---
+    # Precipitation context
+    if precip["current_mm"] is not None and precip["hist_mean_mm"] > 0:
+        p_pct = round((precip["current_mm"] - precip["hist_mean_mm"]) / precip["hist_mean_mm"] * 100, 1)
+        precip_note = (f"Precipitación acumulada: {precip['current_mm']} mm vs "
+                       f"media histórica {precip['hist_mean_mm']} mm "
+                       f"({'+' if p_pct >= 0 else ''}{p_pct}%).")
+    else:
+        precip_note = "Datos de precipitación no disponibles."
+
+    # Thermal
     if lst_z > 1.5:
-        thermal_note = f"Temperatura superficial anómala (+{lst_z:.1f}σ). Riesgo de estrés térmico en ganado y cultivos."
+        thermal = f"Temperatura superficial anómala alta (+{lst_z:.1f}σ). Riesgo de estrés térmico."
     elif lst_z < -2.5:
-        thermal_note = f"Temperatura superficial extremadamente baja ({lst_z:.1f}σ). Riesgo elevado de heladas y daño en cultivos."
+        thermal = f"Temperatura superficial extremadamente baja ({lst_z:.1f}σ). Riesgo elevado de heladas."
     elif lst_z < -1.5:
-        thermal_note = f"Temperatura superficial significativamente baja ({lst_z:.1f}σ). Posible riesgo de heladas y estrés frío en cultivos."
+        thermal = f"Temperatura superficial significativamente baja ({lst_z:.1f}σ). Posible riesgo de heladas."
     else:
-        thermal_note = "Temperatura superficial dentro del rango estacional esperado."
+        thermal = "Temperatura superficial dentro del rango estacional esperado."
 
-    # --- Macro context (proxies for Argentina 2024-2026) ---
-    macro_notes = (
-        "Contexto macro (proxy estimado): inflación ~70% i.a. (estimado 2025), "
-        "tipo de cambio oficial ~$1,100/USD, poder adquisitivo rural bajo presión. "
-        "Costos de insumos agrícolas dolarizados generan margen de maniobra reducido."
-    )
+    # Macro proxies
+    macro = ("Contexto macro estimado (Argentina 2025-2026): inflación ~70% i.a. · "
+             "tipo de cambio oficial ~$1,100/USD · costos de insumos agrícolas dolarizados · "
+             "poder adquisitivo rural bajo presión estructural.")
+
+    # Causality chain
+    if lst_z < -2.0:
+        causality = (f"Anomalía térmica fría (LST {lst_z:.2f}σ) → riesgo de heladas en {region} "
+                     f"→ posible daño foliar → reducción de rendimiento → presión sobre ingresos rurales.")
+    elif ndvi_z < -1.0 and ndwi_z < -1.0:
+        causality = (f"Déficit hídrico (NDWI {ndwi_z:.2f}σ) → estrés vegetal (NDVI {ndvi_z:.2f}σ) "
+                     f"→ reducción de biomasa → menor rendimiento potencial → impacto en cadenas agroindustriales de {region}.")
+    elif lst_z > 1.5 and ndvi_z < -0.5:
+        causality = (f"Anomalía térmica caliente (LST +{lst_z:.2f}σ) → estrés calórico "
+                     f"→ reducción fotosintética (NDVI {ndvi_z:.2f}σ) → riesgo de merma productiva en {region}.")
+    elif ndvi_z > 1.0:
+        causality = (f"Condición vegetal superior (NDVI +{ndvi_z:.2f}σ) → mayor biomasa disponible "
+                     f"→ potencial mejora de rindes → efecto positivo sobre ingresos agropecuarios de {region}.")
+    else:
+        causality = (f"Variables ambientales dentro de rangos históricos en {region}. "
+                     "Sin cadena causal de impacto significativa identificada.")
+
+    crops_at_risk = _crops(region, season, ndvi_z, ndwi_z)
 
     return {
-        "region": region,
-        "season": season,
-        "agriculture": {
-            "assessment": ag_assessment,
-            "yield_impact": yield_impact,
-            "crops_at_risk": _crops_at_risk(region, season, ndvi_z, ndwi_z),
-        },
-        "water": water_note,
-        "thermal": thermal_note,
-        "macro": macro_notes,
-        "causality_chain": _causality_chain(ndvi_z, ndwi_z, lst_z, region),
+        "region": region, "season": season,
+        "agriculture": {"assessment": ag, "yield_impact": yield_impact, "crops_at_risk": crops_at_risk},
+        "water": water, "precipitation": precip_note, "thermal": thermal, "macro": macro,
+        "causality_chain": causality,
         "assumptions": [
-            "Datos macroeconómicos son proxies estimados — fuente: INDEC / BCRA (proyecciones 2025).",
-            "Correlaciones agropecuarias basadas en literatura regional (INTA, FAO).",
-            "El índice NDWI utiliza formulación Gao 1996 (NIR-SWIR), sensible a humedad de canopeo.",
+            "Datos macroeconómicos son proxies estimados (INDEC/BCRA proyecciones 2025-2026).",
+            "NDWI formula Gao 1996 (NIR-SWIR): sensible a humedad de canopeo.",
+            "VCI/TCI/VHI derivados del baseline histórico MODIS 2015-2024.",
+            "Precipitación acumulada fuente CHIRPS (resolución 5.5 km, ~5 días latencia).",
         ],
     }
 
 
-def _crops_at_risk(region: str, season: str, ndvi_z: float, ndwi_z: float) -> list[str]:
-    crops = {
+def _crops(region, season, ndvi_z, ndwi_z):
+    if ndvi_z > -0.5 and ndwi_z > -0.5:
+        return []
+    table = {
         "Pampas": {
             "Primavera": ["Soja (siembra)", "Maíz (siembra tardía)"],
-            "Verano": ["Soja (llenado de grano)", "Maíz (polinización)"],
-            "Otoño": ["Trigo (siembra)", "Girasol (cosecha)"],
-            "Invierno": ["Trigo (macollaje)", "Cebada"],
+            "Verano":    ["Soja (llenado)", "Maíz (polinización)"],
+            "Otoño":     ["Trigo (siembra)", "Girasol (cosecha)"],
+            "Invierno":  ["Trigo (macollaje)", "Cebada"],
         },
         "NEA/NOA": {
             "Primavera": ["Algodón", "Caña de azúcar (rebrote)"],
-            "Verano": ["Soja", "Caña de azúcar"],
-            "Otoño": ["Yerba mate", "Tabaco"],
-            "Invierno": ["Cítricos", "Porotos"],
+            "Verano":    ["Soja", "Caña de azúcar"],
+            "Otoño":     ["Yerba mate", "Tabaco"],
+            "Invierno":  ["Cítricos", "Porotos"],
         },
         "Cuyo": {
             "Primavera": ["Vid (brotación)", "Olivo"],
-            "Verano": ["Vid (envero)"],
-            "Otoño": ["Vid (cosecha)", "Ajo"],
-            "Invierno": ["Vid (dormancia)", "Ajo"],
+            "Verano":    ["Vid (envero)"],
+            "Otoño":     ["Vid (cosecha)", "Ajo"],
+            "Invierno":  ["Vid (dormancia)"],
         },
-    }.get(region, {}).get(season, ["Cultivos regionales"])
-
-    if ndvi_z > -0.5 and ndwi_z > -0.5:
-        return []
-    return crops
-
-
-def _causality_chain(ndvi_z: float, ndwi_z: float, lst_z: float, region: str) -> str:
-    if lst_z < -2.0:
-        return (
-            f"Anomalía térmica negativa severa (LST {lst_z:.2f}σ) → riesgo de heladas "
-            f"y estrés frío en cultivos de {region} → posible daño foliar y reducción de rendimiento "
-            f"→ impacto en costos de producción y volumen cosechado."
-        )
-    if ndvi_z < -1.0 and ndwi_z < -1.0:
-        return (
-            f"Déficit hídrico ({ndwi_z:.2f}σ) → estrés vegetal ({ndvi_z:.2f}σ) "
-            f"→ reducción de biomasa productiva → menor rendimiento potencial en {region} "
-            f"→ impacto en ingresos rurales y cadenas agroindustriales."
-        )
-    if lst_z > 1.5 and ndvi_z < -0.5:
-        return (
-            f"Anomalía térmica positiva (LST {lst_z:.2f}σ) → estrés calórico sobre canopeo "
-            f"→ reducción de eficiencia fotosintética ({ndvi_z:.2f}σ) "
-            f"→ riesgo de merma productiva en {region}."
-        )
-    if ndvi_z > 1.0:
-        return (
-            f"Condición vegetal superior al promedio ({ndvi_z:.2f}σ) en {region} "
-            f"→ mayor biomasa disponible → potencial mejora de rindes "
-            f"→ efecto positivo sobre ingresos agropecuarios regionales."
-        )
-    return (
-        f"Variables ambientales dentro de rangos históricos normales en {region}. "
-        f"Sin cadena causal de impacto significativa identificada."
-    )
+    }
+    return table.get(region, {}).get(season, ["Cultivos regionales"])
 
 
 # ---------------------------------------------------------------------------
@@ -429,46 +407,67 @@ def _causality_chain(ndvi_z: float, ndwi_z: float, lst_z: float, region: str) ->
 # ---------------------------------------------------------------------------
 
 def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
-    days = SCALE_DAYS[scale_label]
+    days       = SCALE_DAYS[scale_label]
     end_date   = date.today()
     start_date = end_date - timedelta(days=days)
-    start_str  = start_date.isoformat()
-    end_str    = end_date.isoformat()
+    start      = start_date.isoformat()
+    end        = end_date.isoformat()
+    cal        = _calendar_months(start_date, end_date)
 
-    cal_months = _calendar_months(start_date, end_date)
-    logger.info("Analysis: lat=%.4f lon=%.4f scale=%s period=%s→%s cal_months=%s",
-                lat, lon, scale_label, start_str, end_str, cal_months)
+    logger.info("Analysis: (%.4f, %.4f) scale=%s %s→%s", lat, lon, scale_label, start, end)
 
-    # Fetch all indices (GEE calls)
-    ndvi_evi_data = fetch_ndvi_evi(lat, lon, start_str, end_str, cal_months)
-    ndwi_data     = fetch_ndwi(lat, lon, start_str, end_str, cal_months)
-    lst_data      = fetch_lst(lat, lon, start_str, end_str, cal_months)
+    # Parallel GEE fetches
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_veg    = pool.submit(_fetch_vegetation, lat, lon, start, end, cal)
+        f_opt    = pool.submit(_fetch_optical,    lat, lon, start, end, cal)
+        f_lst    = pool.submit(_fetch_lst,        lat, lon, start, end, cal)
+        f_precip = pool.submit(_fetch_precip,     lat, lon, start, end, cal)
+        veg_data, opt_data, lst_data, precip_data = (
+            f_veg.result(), f_opt.result(), f_lst.result(), f_precip.result()
+        )
 
-    # Summarize
-    ndvi_sum = summarize_index(ndvi_evi_data["ndvi"]["series"], ndvi_evi_data["ndvi"]["hist"], "ndvi", scale_label)
-    evi_sum  = summarize_index(ndvi_evi_data["evi"]["series"],  ndvi_evi_data["evi"]["hist"],  "evi",  scale_label)
-    ndwi_sum = summarize_index(ndwi_data["series"], ndwi_data["hist"], "ndwi", scale_label)
-    lst_sum  = summarize_index(lst_data["series"],  lst_data["hist"],  "lst",  scale_label)
+    # Summarize each index
+    ndvi = _summarize(veg_data["cur_series"]["NDVI"], veg_data["hist_stats"]["NDVI"], "ndvi", scale_label)
+    evi  = _summarize(veg_data["cur_series"]["EVI"],  veg_data["hist_stats"]["EVI"],  "evi",  scale_label)
+    savi = _summarize(opt_data["cur_series"]["SAVI"], opt_data["hist_stats"]["SAVI"], "savi", scale_label)
+    ndwi = _summarize(opt_data["cur_series"]["NDWI"], opt_data["hist_stats"]["NDWI"], "ndwi", scale_label)
+    mndwi= _summarize(opt_data["cur_series"]["MNDWI"],opt_data["hist_stats"]["MNDWI"],"mndwi",scale_label)
+    nbr  = _summarize(opt_data["cur_series"]["NBR"],  opt_data["hist_stats"]["NBR"],  "nbr",  scale_label)
+    lst  = _summarize(lst_data["cur_series"]["LST"],  lst_data["hist_stats"]["LST"],  "lst",  scale_label)
 
-    indicator = situation_indicator(ndvi_sum, ndwi_sum, evi_sum, lst_sum)
-    socio     = socioeconomic_context(lat, lon, scale_label, ndvi_sum, ndwi_sum, lst_sum)
+    # Derived indices (no extra GEE calls)
+    vci_val = _vci(ndvi["current"], veg_data["hist_stats"]["NDVI"]["min"],
+                                    veg_data["hist_stats"]["NDVI"]["max"])
+    tci_val = _tci(lst["current"],  lst_data["hist_stats"]["LST"]["min"],
+                                    lst_data["hist_stats"]["LST"]["max"])
+    vhi_val = round(0.5 * vci_val + 0.5 * tci_val, 4) if (vci_val and tci_val) else None
+
+    vci_hist = {"mean": 0.5, "std": 0.25, "min": 0.0, "max": 1.0, "count": 0}
+    tci_hist = {"mean": 0.5, "std": 0.25, "min": 0.0, "max": 1.0, "count": 0}
+    vhi_hist = {"mean": 0.5, "std": 0.20, "min": 0.0, "max": 1.0, "count": 0}
+
+    vci  = _summarize([], vci_hist, "vci",  scale_label, current_override=vci_val)
+    tci  = _summarize([], tci_hist, "tci",  scale_label, current_override=tci_val)
+    vhi  = _summarize([], vhi_hist, "vhi",  scale_label, current_override=vhi_val)
+
+    indices = {
+        "ndvi": ndvi, "evi": evi, "savi": savi,
+        "ndwi": ndwi, "mndwi": mndwi, "vci": vci, "vhi": vhi,
+        "lst": lst, "tci": tci, "nbr": nbr,
+        "precipitation": precip_data,
+    }
+
+    indicator = _situation(indices)
+    socio     = _socio(lat, lon, scale_label, indices)
 
     return {
         "meta": {
-            "lat": lat, "lon": lon,
-            "scale": scale_label,
-            "period_start": start_str,
-            "period_end": end_str,
-            "calendar_months": list(cal_months),
-            "region": socio["region"],
-            "season": socio["season"],
+            "lat": lat, "lon": lon, "scale": scale_label,
+            "period_start": start, "period_end": end,
+            "calendar_months": list(cal),
+            "region": socio["region"], "season": socio["season"],
         },
-        "indices": {
-            "ndvi": ndvi_sum,
-            "evi":  evi_sum,
-            "ndwi": ndwi_sum,
-            "lst":  lst_sum,
-        },
+        "indices":             indices,
         "situation_indicator": indicator,
-        "socioeconomic": socio,
+        "socioeconomic":       socio,
     }

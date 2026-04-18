@@ -1,6 +1,5 @@
 """
 GeoEnv Platform — FastAPI backend.
-Serves the environmental analysis API and the static frontend.
 """
 import logging
 import time
@@ -9,12 +8,13 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 import gee_client
 import analysis
+import reporter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="GeoEnv Platform — Argentina",
     description="Environmental indices + socioeconomic diagnostics via Google Earth Engine",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -48,35 +48,25 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# API models
-# ---------------------------------------------------------------------------
-
 class AnalyzeRequest(BaseModel):
-    lat: float = Field(..., ge=-55.0, le=-21.0, description="Latitude (Argentina bounds)")
-    lon: float = Field(..., ge=-73.5, le=-53.5, description="Longitude (Argentina bounds)")
-    scale: Literal["1w", "2w", "1m", "2m", "3m", "6m", "1y"] = Field(
-        default="1m", description="Temporal analysis window"
-    )
+    lat:   float = Field(..., ge=-55.0, le=-21.0)
+    lon:   float = Field(..., ge=-73.5, le=-53.5)
+    scale: Literal["1w", "2w", "1m", "2m", "3m", "6m", "1y"] = "1m"
 
     @field_validator("lat")
     @classmethod
-    def lat_in_argentina(cls, v: float) -> float:
+    def lat_ok(cls, v):
         if not -55.0 <= v <= -21.0:
-            raise ValueError("Latitude must be within Argentina (-55 to -21)")
+            raise ValueError("Latitud fuera de Argentina")
         return v
 
     @field_validator("lon")
     @classmethod
-    def lon_in_argentina(cls, v: float) -> float:
+    def lon_ok(cls, v):
         if not -73.5 <= v <= -53.5:
-            raise ValueError("Longitude must be within Argentina (-73.5 to -53.5)")
+            raise ValueError("Longitud fuera de Argentina")
         return v
 
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -87,33 +77,38 @@ def health():
 def analyze(req: AnalyzeRequest):
     t0 = time.time()
     logger.info("POST /analyze lat=%.4f lon=%.4f scale=%s", req.lat, req.lon, req.scale)
+
     if not gee_client._initialized:
         try:
             gee_client.initialize()
         except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"Google Earth Engine no está disponible: {exc}. "
-                    "Verifique que la cuenta de servicio tenga permisos Earth Engine "
-                    "(roles/earthengine.writer) y que el proyecto esté habilitado en "
-                    "https://code.earthengine.google.com/"
-                ),
-            )
+            raise HTTPException(status_code=503, detail=(
+                f"Earth Engine no disponible: {exc}. "
+                "Verifique roles/earthengine.writer en el proyecto ee-angelini75."
+            ))
+
     try:
         result = analysis.run_analysis(req.lat, req.lon, req.scale)
     except Exception as exc:
         logger.exception("Analysis failed")
         raise HTTPException(status_code=500, detail=str(exc))
-    elapsed = round(time.time() - t0, 2)
-    result["meta"]["elapsed_seconds"] = elapsed
-    logger.info("Analysis complete in %.1fs — indicator=%s", elapsed, result["situation_indicator"])
+
+    result["meta"]["elapsed_seconds"] = round(time.time() - t0, 2)
+    logger.info("Analysis done in %.1fs — indicator=%s", result["meta"]["elapsed_seconds"],
+                result["situation_indicator"])
     return result
 
 
-# ---------------------------------------------------------------------------
-# Static frontend (served last to avoid route conflicts)
-# ---------------------------------------------------------------------------
+@app.post("/report")
+async def report(data: dict):
+    """Streaming SSE endpoint: POST analysis JSON → LLM report chunks."""
+    logger.info("POST /report — generating AI report")
+    return StreamingResponse(
+        reporter.stream_report(data),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
 
 app.mount("/static", StaticFiles(directory="/app/static"), name="static")
 
