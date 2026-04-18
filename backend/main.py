@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    gee_client.initialize()
+    try:
+        gee_client.initialize()
+        logger.info("GEE initialized at startup")
+    except Exception as e:
+        logger.warning("GEE startup init failed (will retry on first request): %s", e)
     yield
 
 
@@ -83,6 +87,19 @@ def health():
 def analyze(req: AnalyzeRequest):
     t0 = time.time()
     logger.info("POST /analyze lat=%.4f lon=%.4f scale=%s", req.lat, req.lon, req.scale)
+    if not gee_client._initialized:
+        try:
+            gee_client.initialize()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Google Earth Engine no está disponible: {exc}. "
+                    "Verifique que la cuenta de servicio tenga permisos Earth Engine "
+                    "(roles/earthengine.writer) y que el proyecto esté habilitado en "
+                    "https://code.earthengine.google.com/"
+                ),
+            )
     try:
         result = analysis.run_analysis(req.lat, req.lon, req.scale)
     except Exception as exc:
