@@ -1,15 +1,15 @@
 """
-LLM report generator using Anthropic SDK with streaming.
+LLM report generator using Google Gemini with streaming.
 Produces a 1-2 page professional report in Spanish from analysis data.
 """
 import os
 import json
 import logging
-import anthropic
+import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-sonnet-4-6"
+MODEL = "gemini-2.0-flash"   # alias: gemini-flash-latest
 
 
 def _fmt(v, decimals=3, unit=""):
@@ -122,25 +122,30 @@ Sé preciso y cuantitativo. Menciona explícitamente la incertidumbre cuando cor
 
 def stream_report(analysis_data: dict):
     """Generator that yields SSE-formatted chunks for FastAPI StreamingResponse."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        yield 'data: {"chunk": "⚠ ANTHROPIC_API_KEY no configurada en el servidor."}\n\n'
+        yield 'data: {"chunk": "⚠ GEMINI_API_KEY no configurada en el servidor."}\n\n'
         yield "data: [DONE]\n\n"
         return
 
-    client = anthropic.Anthropic(api_key=api_key)
-    prompt = build_prompt(analysis_data)
-
     try:
-        with client.messages.stream(
-            model=MODEL,
-            max_tokens=2048,
-            system="Eres un analista geoespacial y socioeconómico de Argentina. Responde solo en español. Sé técnico, preciso y cuantitativo.",
-            messages=[{"role": "user", "content": prompt}],
-        ) as stream:
-            for text in stream.text_stream:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name=MODEL,
+            system_instruction=(
+                "Eres un analista geoespacial y socioeconómico de Argentina. "
+                "Responde solo en español. Sé técnico, preciso y cuantitativo."
+            ),
+        )
+        prompt = build_prompt(analysis_data)
+        response = model.generate_content(prompt, stream=True)
+
+        for chunk in response:
+            text = chunk.text if chunk.text else ""
+            if text:
                 payload = json.dumps({"chunk": text}, ensure_ascii=False)
                 yield f"data: {payload}\n\n"
+
     except Exception as e:
         logger.exception("Report generation failed")
         err_msg = f"\n\n⚠ Error generando informe: {e}"
