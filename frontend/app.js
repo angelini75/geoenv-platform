@@ -270,9 +270,14 @@ function idxCard(name, d, desc, unit = "") {
 
   const zW = z !== null ? Math.min(Math.abs(z) / 3 * 100, 100) : 0;
   const zColor = { normal: "#23d18b", moderate: "#e5b93c", extreme: "#e8425a", nodata: "#1c2d42" }[acKey];
-  const valDisplay = val !== null ? `${val.toFixed(3)}${unit}` : "N/D";
-  const zDisplay   = z !== null ? `${z > 0 ? "+" : ""}${z.toFixed(2)}σ` : "N/D";
-  const pctDisplay = pct !== null ? ` · ${pct > 0 ? "+" : ""}${pct.toFixed(1)}%` : "";
+  const valDisplay = val !== null && val !== undefined ? `${val.toFixed(3)}${unit}` : "N/D";
+  const zDisplay   = z   !== null && z   !== undefined ? `${z > 0 ? "+" : ""}${z.toFixed(2)}σ` : "N/D";
+  const pctDisplay = pct !== null && pct !== undefined ? ` · ${pct > 0 ? "+" : ""}${pct.toFixed(1)}%` : "";
+  // R-005: hist_mean / hist_std can be null for VCI/TCI/VHI when monthly_clim unavailable
+  const meanDisplay = d.hist_mean !== null && d.hist_mean !== undefined
+    ? `μ ${d.hist_mean.toFixed(3)}${unit}` : "μ N/D";
+  const stdDisplay  = d.hist_std  !== null && d.hist_std  !== undefined
+    ? ` · σ ${d.hist_std.toFixed(3)}` : "";
 
   return `
   <div class="idx-card z-${acKey}" role="article" aria-label="${name}: ${valDisplay}">
@@ -281,7 +286,7 @@ function idxCard(name, d, desc, unit = "") {
     <div class="idx-value c-${acKey}" aria-label="Valor actual">${valDisplay}</div>
     <div class="idx-badge badge-${acKey}">${d.anomaly_class}</div>
     <div class="idx-stats">
-      μ ${d.hist_mean.toFixed(3)}${unit} · σ ${d.hist_std.toFixed(3)}<br>
+      ${meanDisplay}${stdDisplay}<br>
       <span class="z-val">${zDisplay}</span>${pctDisplay}
     </div>
     <div class="z-track" aria-hidden="true">
@@ -465,7 +470,9 @@ async function generateReport() {
   btn.textContent = "Generando…";
   body.innerHTML = `<span class="cursor"></span>`;
 
-  let fullText = "";
+  let fullText    = "";
+  let reportDone  = false;   // set when [DONE] event received
+  let reportError = null;    // set when event:error received
 
   try {
     const res = await fetch(`${API_BASE}/report`, {
@@ -478,24 +485,66 @@ async function generateReport() {
 
     const reader  = res.body.getReader();
     const decoder = new TextDecoder();
+    let   currentEvent = null;   // tracks the last "event: X" line seen
 
-    while (true) {
+    outer: while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       const lines = decoder.decode(value, { stream: true }).split("\n");
       for (const line of lines) {
+        // SSE event-type line
+        if (line.startsWith("event: ")) {
+          currentEvent = line.slice(7).trim();
+          continue;
+        }
+        // Empty line = SSE field separator → reset current event
+        if (line === "") { currentEvent = null; continue; }
+        // Data line
         if (!line.startsWith("data: ")) continue;
         const payload = line.slice(6).trim();
-        if (payload === "[DONE]") break;
+
+        // Normal completion signal
+        if (payload === "[DONE]") { reportDone = true; break outer; }
+
         try {
-          const { chunk } = JSON.parse(payload);
-          fullText += chunk;
-          body.innerHTML = marked.parse(fullText) + `<span class="cursor" aria-hidden="true"></span>`;
-          body.scrollIntoView({ behavior: "smooth", block: "end" });
-        } catch { /* partial chunk */ }
+          const parsed = JSON.parse(payload);
+          if (currentEvent === "error") {
+            // R-003: dedicated error event — do NOT mix into report body
+            reportError = parsed.message || "Error desconocido del servidor.";
+            break outer;
+          } else {
+            fullText += parsed.chunk || "";
+            body.innerHTML = marked.parse(fullText) +
+              `<span class="cursor" aria-hidden="true"></span>`;
+            body.scrollIntoView({ behavior: "smooth", block: "end" });
+          }
+        } catch { /* partial / malformed chunk — skip */ }
+        currentEvent = null;
       }
     }
-    body.innerHTML = marked.parse(fullText);
+
+    // Render final report
+    if (fullText) {
+      body.innerHTML = marked.parse(fullText);
+    }
+
+    // R-003: show error banner if stream returned an error event
+    if (reportError) {
+      body.innerHTML = `
+        <div class="report-error-banner" role="alert">
+          <strong>⚠ Error al generar el informe</strong><br>
+          ${esc(reportError)}
+        </div>` + (fullText ? marked.parse(fullText) : "");
+    }
+
+    // R-003: mark as incomplete if stream closed without [DONE] and without error
+    if (!reportDone && !reportError && fullText) {
+      body.innerHTML = marked.parse(fullText) + `
+        <div class="report-incomplete-banner" role="status">
+          ⚠ <em>El informe fue interrumpido antes de completarse. Regénere para obtener el texto completo.</em>
+        </div>`;
+    }
+
   } catch (e) {
     body.innerHTML = `<p style="color:var(--red)">Error generando informe: ${esc(e.message)}</p>`;
   } finally {

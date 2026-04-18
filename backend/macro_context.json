@@ -1,0 +1,6 @@
+{
+  "_updated": "2026-04-18",
+  "_source": "INDEC/BCRA proyecciones 2025-2026",
+  "_note": "Actualizar cuando los indicadores macroeconómicos cambien significativamente (>90 días dispara alerta en logs).",
+  "resumen": "Inflación ~70% i.a. · tipo de cambio oficial ~$1,100/USD · costos de insumos agrícolas dolarizados · poder adquisitivo rural bajo presión estructural · desaceleración del crédito agropecuario."
+}

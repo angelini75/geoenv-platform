@@ -16,11 +16,17 @@ Chart series: last 3 years of monthly OHLC candlesticks (per-month z-scores).
 GEE fetches run in parallel threads to minimize latency.
 """
 import ee
+import json as _json
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import math
+import os as _os
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
 from collections import defaultdict
+
+from cachetools import TTLCache
 
 from gee_client import (
     point_buffer,
@@ -37,6 +43,32 @@ SCALE_DAYS = {
 HIST_START  = "2004-01-01"   # 20-year MODIS baseline
 HIST_END    = "2024-12-31"
 CHART_YEARS = 3              # monthly candle chart spans last N years
+GEE_TIMEOUT = 45             # seconds to wait for each GEE future (R-007)
+
+# ── TTL cache for run_analysis (R-006) ─────────────────────────────
+# Key: (round(lat,3), round(lon,3), scale_label) → ~110m spatial tolerance
+# TTL: 6h — MODIS composites are 8- or 16-day; no point re-fetching within a day.
+_analysis_cache: TTLCache = TTLCache(maxsize=256, ttl=6 * 3600)
+_cache_lock = threading.Lock()
+
+# ── Macro context loader (R-012) ────────────────────────────────────
+_MACRO_FILE = _os.path.join(_os.path.dirname(__file__), "macro_context.json")
+
+def _load_macro() -> str:
+    """Load macro context from external JSON; warn if stale (>90 days)."""
+    try:
+        with open(_MACRO_FILE) as f:
+            data = _json.load(f)
+        updated = date.fromisoformat(data.get("_updated", "2000-01-01"))
+        age_days = (date.today() - updated).days
+        if age_days > 90:
+            logger.warning("macro_context.json tiene %d días sin actualizar (>90)", age_days)
+        source  = data.get("_source", "")
+        resumen = data.get("resumen", "")
+        return f"Contexto macro estimado ({source}): {resumen}"
+    except Exception as e:
+        logger.warning("No se pudo cargar macro_context.json: %s", e)
+        return "Contexto macroeconómico no disponible (macro_context.json ausente o inválido)."
 
 MONTH_NAMES = {
     1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
@@ -55,7 +87,9 @@ def _zscore(value, mean, std):
 
 
 def _pct_dev(value, mean):
-    if None in (value, mean) or mean == 0:
+    # R-010: guard against near-zero mean (NDWI/MNDWI can be ~0 in arid zones)
+    # which produces meaningless thousands-of-percent values.
+    if None in (value, mean) or abs(mean) < 0.01:
         return None
     return round((value - mean) / abs(mean) * 100, 2)
 
@@ -165,8 +199,9 @@ def _summarize(cur_series: list[dict], chart_series: list[dict],
 
     cur_month = date.today().month
     m_stats   = (monthly_clim or {}).get(cur_month, {})
-    clim_mean = m_stats.get("mean") or hist_alltime.get("mean")
-    clim_std  = m_stats.get("std")  or hist_alltime.get("std")
+    # Use `is not None` guard — a mean of 0.0 is falsy but valid (e.g. NDWI in arid zones)
+    clim_mean = m_stats["mean"] if m_stats.get("mean") is not None else hist_alltime.get("mean")
+    clim_std  = m_stats["std"]  if m_stats.get("std")  is not None else hist_alltime.get("std")
 
     z = _zscore(val, clim_mean, clim_std)
 
@@ -188,8 +223,9 @@ def _summarize(cur_series: list[dict], chart_series: list[dict],
         "pct_deviation":   _pct_dev(val, clim_mean),
         "anomaly_class":   _classify(z),
         "candlesticks":    candles,
-        "seasonal_curve":  seasonal_means,      # 12-month climatology means
-        "monthly_clim":    monthly_clim,        # full mean+std per month (for reporter)
+        "seasonal_curve":  seasonal_means,      # 12-month climatology means (used by reporter)
+        # R-011: monthly_clim removed — seasonal_curve already has the 12 means;
+        # the raw mean+std dict was redundant (~240 extra floats in the payload).
         "n_observations":  len(cur_series),
         "hist_n_images":   hist_alltime.get("count", 0),
     }
@@ -265,9 +301,14 @@ def _vhi_clim(vci_clim, tci_clim):
         v = (vci_clim or {}).get(m, {})
         t = (tci_clim or {}).get(m, {})
         if v.get("mean") is not None and t.get("mean") is not None:
+            std_v = v.get("std") or 0.0
+            std_t = t.get("std") or 0.0
+            # R-009: correct variance propagation for VHI = 0.5*VCI + 0.5*TCI.
+            # Assuming independence (conservative): sqrt(0.25*var_v + 0.25*var_t).
+            # The linear average (0.5*sd_v + 0.5*sd_t) would underestimate uncertainty.
             result[m] = {
                 "mean": round(0.5 * v["mean"] + 0.5 * t["mean"], 4),
-                "std":  round(0.5 * (v.get("std") or 0) + 0.5 * (t.get("std") or 0), 4),
+                "std":  round(math.sqrt(0.25 * std_v**2 + 0.25 * std_t**2), 4),
             }
     return result
 
@@ -361,17 +402,21 @@ def _fetch_precip(lat, lon, start, end, cal):
 # Region / season / situation helpers
 # ---------------------------------------------------------------------------
 
-_REGIONS = {
-    (-34, -22, -64, -53): "NEA/NOA",
-    (-38, -30, -65, -57): "Pampas",
-    (-45, -38, -72, -65): "Patagonia Norte",
-    (-55, -45, -75, -63): "Patagonia Sur",
-    (-34, -28, -70, -64): "Cuyo",
-}
+# R-008: converted from dict to ordered list so the lookup is deterministic
+# (dict was CPython insertion-order by accident, not by design).
+# Cuyo checked before Pampas because its bbox is more specific (western longitudes).
+# Tuple format: (lat_min, lat_max, lon_min, lon_max)
+_REGIONS = [
+    ((-34, -22, -64, -53), "NEA/NOA"),
+    ((-34, -28, -70, -64), "Cuyo"),           # checked before Pampas
+    ((-38, -30, -65, -57), "Pampas"),
+    ((-45, -38, -72, -65), "Patagonia Norte"),
+    ((-55, -45, -75, -63), "Patagonia Sur"),
+]
 
 
 def _region(lat, lon):
-    for (la, lb, lo, lob), name in _REGIONS.items():
+    for (la, lb, lo, lob), name in _REGIONS:
         if la <= lat <= lb and lo <= lon <= lob:
             return name
     return "Argentina"
@@ -443,9 +488,7 @@ def _socio(lat, lon, scale, idx: dict) -> dict:
         else "Temperatura superficial dentro del rango estacional esperado."
     )
 
-    macro = ("Contexto macro estimado (Argentina 2025-2026): inflación ~70% i.a. · "
-             "tipo de cambio oficial ~$1,100/USD · costos de insumos agrícolas dolarizados · "
-             "poder adquisitivo rural bajo presión estructural.")
+    macro = _load_macro()   # R-012: loaded from macro_context.json (versioned, with staleness alert)
 
     if lst_z < -2.0:
         causality = (f"Anomalía térmica fría (LST {lst_z:.2f}σ estacional) → riesgo de heladas en {region} "
@@ -472,10 +515,13 @@ def _socio(lat, lon, scale, idx: dict) -> dict:
         "causality_chain": causality,
         "assumptions": [
             "Baseline histórico MODIS 2004-2024 (20 años). Z-scores ajustados estacionalmente por mes calendario.",
-            "Datos macroeconómicos son proxies estimados (INDEC/BCRA proyecciones 2025-2026).",
-            "NDWI formula Gao 1996 (NIR-SWIR): sensible a humedad de canopeo.",
+            "LIMITACIÓN (R-004): el baseline es estático 2004-2024. Si una variable tiene tendencia climática "
+            "(ej.: LST en ascenso +0.5°C/décad), el z-score incorpora ese sesgo. "
+            "Los valores no reflejan si la anomalía es relativa a la nueva normalidad climática.",
             "VCI/TCI/VHI climatologías derivadas de las curvas estacionales de NDVI y LST.",
+            "NDWI formula Gao 1996 (NIR-SWIR): sensible a humedad de canopeo.",
             "Precipitación acumulada fuente CHIRPS (resolución 5.5 km, ~5 días latencia).",
+            "Datos macroeconómicos son proxies estimados; ver macro_context.json para fecha de actualización.",
         ],
     }
 
@@ -505,6 +551,13 @@ def _crops(region, season, ndvi_z, ndwi_z):
 # ---------------------------------------------------------------------------
 
 def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
+    # R-006: check cache before hitting GEE
+    cache_key = (round(lat, 3), round(lon, 3), scale_label)
+    with _cache_lock:
+        if cache_key in _analysis_cache:
+            logger.info("Cache HIT — (%.3f, %.3f) scale=%s", lat, lon, scale_label)
+            return _analysis_cache[cache_key]
+
     days       = SCALE_DAYS[scale_label]
     end_date   = date.today()
     start_date = end_date - timedelta(days=days)
@@ -519,9 +572,19 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
         f_opt    = pool.submit(_fetch_optical,    lat, lon, start, end, cal)
         f_lst    = pool.submit(_fetch_lst,        lat, lon, start, end, cal)
         f_precip = pool.submit(_fetch_precip,     lat, lon, start, end, cal)
-        veg_data, opt_data, lst_data, precip_data = (
-            f_veg.result(), f_opt.result(), f_lst.result(), f_precip.result()
-        )
+        # R-007: bound the wait so a hung GEE call never freezes the uvicorn worker.
+        try:
+            veg_data    = f_veg.result(timeout=GEE_TIMEOUT)
+            opt_data    = f_opt.result(timeout=GEE_TIMEOUT)
+            lst_data    = f_lst.result(timeout=GEE_TIMEOUT)
+            precip_data = f_precip.result(timeout=GEE_TIMEOUT)
+        except FutureTimeoutError:
+            for f in [f_veg, f_opt, f_lst, f_precip]:
+                f.cancel()
+            raise TimeoutError(
+                f"Earth Engine no respondió en {GEE_TIMEOUT}s. "
+                "El servicio puede estar saturado; reintente en un momento."
+            )
 
     # --- Measured indices ---
     ndvi_hist  = veg_data["hist_stats"]["NDVI"]
@@ -555,9 +618,13 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
     tci_chart = _tci_series(lst_data["chart_series"]["LST"],  lst_hist["min"],  lst_hist["max"])
     vhi_chart = _vhi_series(vci_chart, tci_chart)
 
-    vci_alltime = {"mean": 0.5, "std": 0.25, "min": 0.0, "max": 1.0, "count": 0}
-    tci_alltime = {"mean": 0.5, "std": 0.25, "min": 0.0, "max": 1.0, "count": 0}
-    vhi_alltime = {"mean": 0.5, "std": 0.20, "min": 0.0, "max": 1.0, "count": 0}
+    # R-005: use mean=None/std=None so that when monthly_clim is unavailable
+    # (e.g. hmax==hmin pixel → _derived_clim returns {}), _summarize falls back
+    # to None → z_score=None → anomaly_class="Sin datos" instead of a phantom
+    # z-score based on the meaningless 0.5±0.25 placeholder.
+    vci_alltime = {"mean": None, "std": None, "min": 0.0, "max": 1.0, "count": 0}
+    tci_alltime = {"mean": None, "std": None, "min": 0.0, "max": 1.0, "count": 0}
+    vhi_alltime = {"mean": None, "std": None, "min": 0.0, "max": 1.0, "count": 0}
 
     vci = _summarize([], vci_chart, vci_alltime, vci_clim, "vci", scale_label, current_override=vci_val)
     tci = _summarize([], tci_chart, tci_alltime, tci_clim, "tci", scale_label, current_override=tci_val)
@@ -573,7 +640,7 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
     indicator = _situation(indices)
     socio     = _socio(lat, lon, scale_label, indices)
 
-    return {
+    result = {
         "meta": {
             "lat": lat, "lon": lon, "scale": scale_label,
             "period_start": start, "period_end": end,
@@ -588,3 +655,8 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
         "situation_indicator": indicator,
         "socioeconomic":       socio,
     }
+
+    # R-006: store in cache (elapsed_seconds is added by main.py after this call)
+    with _cache_lock:
+        _analysis_cache[cache_key] = result
+    return result

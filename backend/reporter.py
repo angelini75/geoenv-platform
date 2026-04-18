@@ -159,30 +159,20 @@ def build_llm_payload(data: dict) -> dict:
     for key, d in idx.items():
         if key == "precipitation":
             continue
-        defn = INDEX_DEFS.get(key.upper(), {})
+        # R-014: "definicion" block removed from user prompt — it's now in SYSTEM_INSTRUCTION
+        # (static content → implicit caching; reduces per-call token usage).
         indices_payload[key.upper()] = {
-            "definicion": {
-                "nombre":           defn.get("nombre", key.upper()),
-                "formula":          defn.get("formula", ""),
-                "rango_tipico":     defn.get("rango_tipico", ""),
-                "fuente":           defn.get("fuente", ""),
-                "estacionalidad":   defn.get("estacionalidad", ""),
-                "anomalia_positiva":defn.get("anomalia_positiva", ""),
-                "anomalia_negativa":defn.get("anomalia_negativa", ""),
-            },
-            "datos": {
-                "valor_actual":            d.get("current"),
-                "media_estacional_mes_actual": d.get("hist_mean"),   # current-month seasonal mean
-                "desvio_estacional":       d.get("hist_std"),
-                "z_score_estacional":      d.get("z_score"),         # vs same calendar month
-                "desviacion_pct":          d.get("pct_deviation"),
-                "clase_anomalia":          d.get("anomaly_class"),
-                "hist_min_20yr":           d.get("hist_min"),
-                "hist_max_20yr":           d.get("hist_max"),
-                "curva_estacional_medias": _compact_curve(d.get("seasonal_curve")),
-                "velas_recientes_6m":      _recent_candles(d.get("candlesticks", [])),
-                "n_observaciones_periodo": d.get("n_observations", 0),
-            },
+            "valor_actual":            d.get("current"),
+            "media_estacional_mes_actual": d.get("hist_mean"),   # current-month seasonal mean
+            "desvio_estacional":       d.get("hist_std"),
+            "z_score_estacional":      d.get("z_score"),         # vs same calendar month
+            "desviacion_pct":          d.get("pct_deviation"),
+            "clase_anomalia":          d.get("anomaly_class"),
+            "hist_min_20yr":           d.get("hist_min"),
+            "hist_max_20yr":           d.get("hist_max"),
+            "curva_estacional_medias": _compact_curve(d.get("seasonal_curve")),
+            "velas_recientes_6m":      _recent_candles(d.get("candlesticks", [])),
+            "n_observaciones_periodo": d.get("n_observations", 0),
         }
 
     return {
@@ -229,20 +219,44 @@ def build_llm_payload(data: dict) -> dict:
     }
 
 
-SYSTEM_INSTRUCTION = """Eres un analista geoespacial y socioeconómico especializado en Argentina.
+def _index_defs_text() -> str:
+    """Format INDEX_DEFS as human-readable text for the system instruction (R-014)."""
+    lines = ["DEFINICIÓN DE ÍNDICES SATELITALES:\n"]
+    for key, d in INDEX_DEFS.items():
+        lines.append(f"{key} — {d['nombre']}")
+        lines.append(f"  Fórmula:            {d['formula']}")
+        lines.append(f"  Rango típico:       {d['rango_tipico']}")
+        lines.append(f"  Fuente:             {d['fuente']}")
+        lines.append(f"  Estacionalidad:     {d['estacionalidad']}")
+        lines.append(f"  Anomalía positiva:  {d['anomalia_positiva']}")
+        lines.append(f"  Anomalía negativa:  {d['anomalia_negativa']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# R-014: INDEX_DEFS moved to SYSTEM_INSTRUCTION (static content → implicit caching).
+# The user prompt only carries per-call data (values, curves, candles).
+SYSTEM_INSTRUCTION = f"""Eres un analista geoespacial y socioeconómico especializado en Argentina.
 Tu tarea es redactar informes técnicos basados en índices satelitales MODIS y datos climatológicos.
 
-CONOCIMIENTO CLAVE:
-- Los z-scores en este sistema son ESTACIONALES: cada índice se compara contra la media del MISMO mes
-  calendario a lo largo de 20 años (2004-2024), no contra un promedio anual.
+{_index_defs_text()}
+METODOLOGÍA DE Z-SCORES (FUNDAMENTAL — leer antes de interpretar cualquier dato):
+- Los z-scores en este sistema son ESTACIONALES: cada índice se compara contra la media del MISMO
+  mes calendario a lo largo de 20 años (2004-2024), NO contra un promedio anual.
   Esto corrige la estacionalidad natural (ej: NDVI alto en enero no es anomalía si enero siempre es alto).
 - La curva_estacional_medias muestra el patrón típico mensual de cada índice (12 valores).
-- VHI < 0.2 = emergencia de sequía; 0.2-0.35 = sequía severa.
-- Z-score > +2σ o < −2σ = anomalía extrema respecto al mismo mes histórico.
+- LIMITACIÓN: el baseline es estático 2004-2024. Tendencias climáticas de largo plazo pueden
+  sesgar los z-scores. Menciona esta limitación cuando sea relevante.
+
+UMBRALES DE CLASIFICACIÓN:
+- |z| < 1σ   → Normal
+- 1σ ≤ |z| < 1.5σ → Anomalía moderada
+- |z| ≥ 1.5σ → Anomalía extrema
+- VHI < 0.2  → Emergencia de sequía; 0.2–0.35 → Sequía severa
 - Las velas recientes muestran la tendencia de los últimos 6 meses (OHLC mensual).
 
 Escribe en español técnico, con precisión cuantitativa. Usa Markdown (## y **negritas**).
-Objetivo: 600–900 palabras en 5 secciones ordenadas."""
+Objetivo: 600–900 palabras en 5 secciones ordenadas. No inventes datos ausentes del JSON."""
 
 
 def build_prompt(payload: dict) -> str:
@@ -321,7 +335,12 @@ def stream_report(analysis_data: dict):
 
     except Exception as e:
         logger.exception("Report generation failed")
-        err_msg = f"\n\n⚠ Error generando informe: {e}"
-        yield f"data: {json.dumps({'chunk': err_msg})}\n\n"
+        # R-003: use a dedicated SSE event type so the frontend can display
+        # the error separately from the report body (not mixed into the text).
+        err_payload = json.dumps({"message": str(e), "code": type(e).__name__}, ensure_ascii=False)
+        yield f"event: error\ndata: {err_payload}\n\n"
+        # Do NOT yield [DONE] after an error so the frontend knows the stream
+        # closed abnormally and can mark the report as incomplete.
+        return
 
     yield "data: [DONE]\n\n"
