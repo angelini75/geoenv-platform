@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+secrets/
+*.json
+!package.json
+.DS_Store
+Thumbs.db
