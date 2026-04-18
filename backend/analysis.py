@@ -268,13 +268,12 @@ def situation_indicator(ndvi_sum: dict, ndwi_sum: dict, evi_sum: dict, lst_sum: 
     ndwi_z = ndwi_sum.get("z_score") or 0
     lst_z  = lst_sum.get("z_score") or 0
 
-    # Critical: severe vegetation collapse or extreme heat + water stress
-    if ndvi_z < -2.0 or (ndwi_z < -1.5 and lst_z > 1.5):
+    # Critical: severe vegetation collapse, extreme heat+water stress, or extreme cold snap
+    if ndvi_z < -2.0 or (ndwi_z < -1.5 and lst_z > 1.5) or lst_z < -2.5:
         return "CRÍTICO"
 
-    # Alert: multiple indices outside 1 std
-    n_stressed = sum(1 for z in [ndvi_z, ndwi_z, lst_z] if z < -1.0 or (z > 1.5 and "lst" in str(z)))
-    if ndvi_z < -1.5 or ndwi_z < -1.5 or lst_z > 2.0:
+    # Alert: heat stress, cold anomaly, or vegetation/water stress
+    if ndvi_z < -1.5 or ndwi_z < -1.5 or lst_z > 2.0 or lst_z < -2.0:
         return "ALERTA"
     if abs(ndvi_z) < 0.5 and abs(ndwi_z) < 0.5 and abs(lst_z) < 0.5:
         return "FAVORABLE"
@@ -333,8 +332,10 @@ def socioeconomic_context(lat: float, lon: float, scale_label: str,
     # --- Thermal context ---
     if lst_z > 1.5:
         thermal_note = f"Temperatura superficial anómala (+{lst_z:.1f}σ). Riesgo de estrés térmico en ganado y cultivos."
+    elif lst_z < -2.5:
+        thermal_note = f"Temperatura superficial extremadamente baja ({lst_z:.1f}σ). Riesgo elevado de heladas y daño en cultivos."
     elif lst_z < -1.5:
-        thermal_note = f"Temperatura superficial baja ({lst_z:.1f}σ). Posible riesgo de heladas fuera de estación."
+        thermal_note = f"Temperatura superficial significativamente baja ({lst_z:.1f}σ). Posible riesgo de heladas y estrés frío en cultivos."
     else:
         thermal_note = "Temperatura superficial dentro del rango estacional esperado."
 
@@ -393,6 +394,12 @@ def _crops_at_risk(region: str, season: str, ndvi_z: float, ndwi_z: float) -> li
 
 
 def _causality_chain(ndvi_z: float, ndwi_z: float, lst_z: float, region: str) -> str:
+    if lst_z < -2.0:
+        return (
+            f"Anomalía térmica negativa severa (LST {lst_z:.2f}σ) → riesgo de heladas "
+            f"y estrés frío en cultivos de {region} → posible daño foliar y reducción de rendimiento "
+            f"→ impacto en costos de producción y volumen cosechado."
+        )
     if ndvi_z < -1.0 and ndwi_z < -1.0:
         return (
             f"Déficit hídrico ({ndwi_z:.2f}σ) → estrés vegetal ({ndvi_z:.2f}σ) "
