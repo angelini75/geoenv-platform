@@ -9,7 +9,7 @@ import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-2.0-flash"   # alias: gemini-flash-latest
+MODEL = "gemini-1.5-flash"   # free-tier compatible
 
 
 def _fmt(v, decimals=3, unit=""):
