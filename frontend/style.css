@@ -68,14 +68,19 @@ body {
 /* ── Workspace (map + controls, fixed height) ── */
 .workspace {
   height: var(--map-h);
+  min-height: 280px;
   display: flex;
+  flex-direction: row;        /* explicit — prevents any flex-direction ambiguity */
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  overflow: hidden;
 }
 
 #map {
-  flex: 1;
+  flex: 1 1 0%;
   min-width: 0;
+  height: 100%;               /* Leaflet requires explicit height on the container */
+  position: relative;
 }
 
 /* leaflet override */
@@ -167,9 +172,12 @@ body {
 /* ── Dashboard ── */
 #dashboard {
   padding: 0 0 60px;
-  display: none;
+  display: none;          /* JS adds .visible to show it */
 }
 #dashboard.visible { display: block; }
+
+/* Ensure the dashboard sections look right when first revealed */
+#dashboard .sit-banner:empty { display: none; }
 
 /* ── Situation banner ── */
 .sit-banner {

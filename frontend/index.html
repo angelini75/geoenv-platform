@@ -7,7 +7,7 @@
 
   <!-- Performance: preconnect to external resources -->
   <link rel="preconnect" href="https://server.arcgisonline.com">
-  <link rel="preconnect" href="https://services.arcgisonline.com">
+  <link rel="preconnect" href="https://basemaps.cartocdn.com">
   <link rel="preconnect" href="https://unpkg.com">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -36,7 +36,13 @@
 <!-- ═══ WORKSPACE (map + controls) ═══ -->
 <div class="workspace" role="main">
 
-  <div id="map" role="application" aria-label="Mapa interactivo de Argentina — haga clic para seleccionar un punto de análisis"></div>
+  <!--
+    height:100% inline → Leaflet requires an explicit height on its container.
+    CSS flex:1 handles width; this handles height within the flex parent.
+  -->
+  <div id="map" style="height:100%"
+       role="application"
+       aria-label="Mapa interactivo de Argentina — haga clic para seleccionar un punto de análisis"></div>
 
   <!-- Control panel -->
   <aside class="ctrl-panel" aria-label="Panel de control">
@@ -72,7 +78,10 @@
 </div>
 
 <!-- ═══ DASHBOARD (scrollable, hidden until analysis runs) ═══ -->
-<section id="dashboard" aria-live="polite" aria-label="Resultados del análisis ambiental">
+<!-- style="display:none" is an inline fallback in case CSS hasn't applied yet -->
+<section id="dashboard" style="display:none"
+         aria-live="polite"
+         aria-label="Resultados del análisis ambiental">
 
   <!-- Situation banner -->
   <div class="sit-banner" id="sit-banner"></div>

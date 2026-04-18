@@ -18,19 +18,33 @@ const map = L.map("map", {
   center: [-38.5, -65],
   zoom: 5,
   zoomControl: true,
+  preferCanvas: true,
 });
 
-// Satellite imagery (ESRI World Imagery — no API key needed)
+// Satellite imagery — ESRI World Imagery (no API key, global CDN)
 L.tileLayer(
   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-  { attribution: "Imagery © Esri, Earthstar Geographics", maxZoom: 19 }
+  {
+    attribution: "Tiles &copy; Esri &mdash; Source: Esri, USGS, NOAA",
+    maxZoom: 19,
+    crossOrigin: true,
+  }
 ).addTo(map);
 
-// Labels overlay (ESRI World Reference)
+// Labels overlay — CartoDB (lightweight, reliable, no key needed)
 L.tileLayer(
-  "https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
-  { attribution: "", maxZoom: 19, opacity: 0.85, pane: "shadowPane" }
+  "https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}{r}.png",
+  {
+    attribution: "&copy; CartoDB",
+    subdomains: "abcd",
+    maxZoom: 19,
+    opacity: 0.9,
+    pane: "shadowPane",
+  }
 ).addTo(map);
+
+// Force Leaflet to recalculate size after first render (fixes 0-height container edge case)
+setTimeout(() => map.invalidateSize(), 200);
 
 // Argentina bounding box guide
 L.rectangle([[-55.1, -73.6], [-21.8, -53.4]], {
@@ -125,6 +139,7 @@ function setBtnState(loading) {
 // ── Dashboard visibility ─────────────────────────────────────────
 function showDashboard() {
   const d = document.getElementById("dashboard");
+  d.style.display = "";          // remove inline fallback, let CSS class take over
   d.classList.add("visible");
   d.scrollIntoView({ behavior: "smooth", block: "start" });
 }
