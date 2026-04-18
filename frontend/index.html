@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GeoEnv — Indicadores Ambientales Argentina</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+<div class="layout">
+
+  <header>
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2">
+      <circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+    </svg>
+    <span class="logo">GeoEnv Platform</span>
+    <span class="subtitle">Diagnóstico ambiental — Argentina · MODIS / GEE</span>
+  </header>
+
+  <div class="body">
+    <div id="map"></div>
+
+    <div id="panel">
+      <div class="panel-controls">
+
+        <div class="coords-box" id="coords-box">
+          Haga clic en el mapa para seleccionar un punto
+        </div>
+
+        <div class="scale-label">Ventana temporal</div>
+        <div class="scale-grid" id="scale-grid">
+          <button class="scale-btn" data-scale="1w">1s</button>
+          <button class="scale-btn" data-scale="2w">2s</button>
+          <button class="scale-btn active" data-scale="1m">1m</button>
+          <button class="scale-btn" data-scale="2m">2m</button>
+          <button class="scale-btn" data-scale="3m">3m</button>
+          <button class="scale-btn" data-scale="6m">6m</button>
+          <button class="scale-btn" data-scale="1y">1a</button>
+        </div>
+
+        <button id="btn-analyze" disabled>
+          Analizar punto
+        </button>
+      </div>
+
+      <div id="results">
+        <div class="placeholder">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>
+          </svg>
+          <p>Seleccione un punto en Argentina<br>y haga clic en <strong>Analizar</strong></p>
+        </div>
+      </div>
+    </div><!-- #panel -->
+  </div>
+
+</div><!-- .layout -->
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
