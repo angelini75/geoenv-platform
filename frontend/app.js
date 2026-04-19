@@ -58,9 +58,13 @@ function makeMarkerIcon(id, color) {
 
 // ── Point management ───────────────────────────────────────────
 function addPoint(lat, lon) {
-  if (state.points.length >= 5) return;
+  // Single-point mode: remove existing point before adding new one
+  if (state.points.length >= 1) {
+    state.points[0].marker.remove();
+    state.points.splice(0, 1);
+  }
   const id     = state.nextId++;
-  const color  = POINT_COLORS[(id - 1) % 5];
+  const color  = POINT_COLORS[0];
   const marker = L.marker([lat, lon], { icon: makeMarkerIcon(id, color) }).addTo(map);
   marker.on("click", (e) => { L.DomEvent.stop(e); removePoint(id); });
   state.points.push({ id, lat, lon, color, marker, result: null });
@@ -73,23 +77,11 @@ function removePoint(id) {
   if (idx === -1) return;
   state.points[idx].marker.remove();
   state.points.splice(idx, 1);
-  if (state.activeId === id) {
-    const withResult = [...state.points].reverse().find(p => p.result && !p.result._error);
-    state.activeId = withResult
-      ? withResult.id
-      : state.points.length > 0 ? state.points[state.points.length - 1].id : null;
-  }
+  state.activeId = null;
   updateControlPanel();
-  const hasResults = state.points.some(p => p.result && !p.result._error);
-  if (hasResults) {
-    renderPointTabs();
-    renderAllCharts();           // update charts without the removed point
-    const ap = state.points.find(p => p.id === state.activeId);
-    if (ap?.result && !ap.result._error) renderIndexSections(ap.result);
-  } else if (state.points.length === 0) {
+  if (state.points.length === 0) {
     document.getElementById("dashboard").classList.remove("visible");
     document.getElementById("dashboard").style.display = "none";
-    document.getElementById("point-tabs-bar").style.display = "none";
   }
 }
 
@@ -113,15 +105,15 @@ function updateControlPanel() {
 
   if (!listEl || !btn) return;   // guard: DOM not ready yet
 
-  countEl.textContent = n > 0 ? `(${n}/5)` : "";
+  countEl.textContent = "";
 
   if (n === 0) {
-    listEl.innerHTML = `<div class="points-hint">Haga clic en el mapa · hasta 5 puntos</div>`;
+    listEl.innerHTML = `<div class="points-hint">Haga clic en el mapa para seleccionar un punto</div>`;
   } else {
     listEl.innerHTML = state.points.map(p => `
-      <div class="point-row${p.id === state.activeId ? " is-active" : ""}${p.result && !p.result._error ? " has-result" : ""}"
-           role="listitem" onclick="setActivePoint(${p.id})">
-        <span class="point-badge" style="background:${p.color}">${p.id}</span>
+      <div class="point-row${p.result && !p.result._error ? " has-result" : ""}"
+           role="listitem">
+        <span class="point-badge" style="background:${p.color}">●</span>
         <span class="point-coord-pair">
           <span class="point-coord">${p.lat.toFixed(4)}</span>
           <span class="point-coord-sep">,</span>
@@ -132,16 +124,15 @@ function updateControlPanel() {
           ${p.result && !p.result._error ? `<span class="point-done" title="Análisis listo">✓</span>` : ""}
           ${p.result && p.result._error  ? `<span class="point-err"  title="${esc(p.result._error)}">!</span>` : ""}
         </span>
-        <button class="point-remove" onclick="event.stopPropagation();removePoint(${p.id})"
-                aria-label="Eliminar punto ${p.id}">×</button>
+        <button class="point-remove" onclick="removePoint(${p.id})"
+                aria-label="Eliminar punto">×</button>
       </div>`).join("");
   }
 
   btn.disabled = (n === 0) || state.loading;
   btn.textContent = state.loading ? "Analizando…"
-    : n === 0   ? "Seleccione un punto"
-    : n === 1   ? "Analizar punto"
-    : `Analizar ${n} puntos`;
+    : n === 0 ? "Seleccione un punto"
+    : "Analizar punto";
 }
 
 // ── Map click ──────────────────────────────────────────────────
@@ -150,7 +141,6 @@ map.on("click", ({ latlng }) => {
   // Argentina bounding box guard
   if (lat < -55.1 || lat > -21.8 || lng < -73.6 || lng > -53.4) return;
   if (state.loading) return;
-  if (state.points.length >= 5) return;
   addPoint(parseFloat(lat.toFixed(5)), parseFloat(lng.toFixed(5)));
 });
 
@@ -212,13 +202,11 @@ function showDashboard() {
 
 function renderDashboardFull() {
   clearInterval(document._spinnerTicker);
-  renderPointTabs();
 
   const point = state.points.find(p => p.id === state.activeId);
   if (!point?.result || point.result._error) return;
 
-  renderIndexSections(point.result);   // per-point: banner, cards, precip, socio
-  renderAllCharts();                   // ALL points: candlestick series per index
+  renderIndexSections(point.result);
   if (state.marketData) renderMarket(state.marketData);
 }
 
@@ -255,15 +243,6 @@ function showGlobalSpinner() {
 /** Clear everything — called before a new analysis run */
 function clearAllSections() {
   clearIndexSections();
-  // Destroy chart instances and clear chart containers
-  ["charts-veg","charts-water","charts-thermal"].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.innerHTML = "";
-  });
-  Object.keys(_lwCharts).forEach(k => {
-    try { _lwCharts[k].remove(); } catch (_) {}
-    delete _lwCharts[k];
-  });
 }
 
 /** Clear only per-point content — called on tab switch */
@@ -294,23 +273,6 @@ function showDashboardError(msg) {
       </svg>
       <p>${esc(msg)}</p>
     </div>`;
-}
-
-// ── Point tabs ─────────────────────────────────────────────────
-function renderPointTabs() {
-  const bar         = document.getElementById("point-tabs-bar");
-  const withResults = state.points.filter(p => p.result);
-  if (withResults.length <= 1) { bar.style.display = "none"; return; }
-  bar.style.display = "flex";
-  bar.innerHTML = withResults.map(p => `
-    <button class="point-tab${p.id === state.activeId ? " active" : ""}"
-            role="tab" aria-selected="${p.id === state.activeId}"
-            style="--tab-color:${p.color}"
-            onclick="setActivePoint(${p.id})">
-      <span class="tab-dot" style="background:${p.color}"></span>
-      Punto ${p.id}
-      ${p.result._error ? `<span class="tab-err">!</span>` : ""}
-    </button>`).join("");
 }
 
 // ── Index sections — per active point ─────────────────────────
@@ -381,209 +343,6 @@ function renderIndexSections(data) {
 
   // Show market if already loaded
   if (state.marketData) renderMarket(state.marketData);
-}
-
-// ── Charts — seasonal band + recent trend ─────────────────────
-let _lwCharts = {};
-
-const CHART_GROUPS = [
-  { containerId: "charts-veg",
-    defs: [
-      { key:"ndvi", label:"NDVI", bandColor:"#23d18b" },
-      { key:"evi",  label:"EVI",  bandColor:"#23d18b" },
-      { key:"savi", label:"SAVI", bandColor:"#23d18b" },
-    ]},
-  { containerId: "charts-water",
-    defs: [
-      { key:"ndwi",  label:"NDWI",  bandColor:"#3b9eff" },
-      { key:"mndwi", label:"MNDWI", bandColor:"#3b9eff" },
-      { key:"vci",   label:"VCI",   bandColor:"#3b9eff" },
-    ]},
-  { containerId: "charts-thermal",
-    defs: [
-      { key:"lst",       label:"LST día (°C)",  bandColor:"#e5b93c" },
-      { key:"lst_night", label:"LST noche (°C)", bandColor:"#e8a03a" },
-      { key:"tci",       label:"TCI",           bandColor:"#e5b93c" },
-      { key:"nbr",       label:"NBR",           bandColor:"#f07b3a" },
-    ]},
-];
-
-// hex #rrggbb → rgba(r,g,b,alpha)
-function hexRgba(hex, alpha) {
-  const r = parseInt(hex.slice(1,3), 16);
-  const g = parseInt(hex.slice(3,5), 16);
-  const b = parseInt(hex.slice(5,7), 16);
-  return `rgba(${r},${g},${b},${alpha})`;
-}
-
-function renderAllCharts() {
-  const valid  = state.points.filter(p => p.result && !p.result._error);
-  if (!valid.length) return;
-  const single = valid.length === 1;
-  for (const g of CHART_GROUPS) renderChartGroup(g.containerId, g.defs, valid, single);
-}
-
-function renderChartGroup(containerId, defs, validPoints, single) {
-  const container = document.getElementById(containerId);
-  if (!container) return;
-
-  // Keep only defs where ≥1 point has recent_series data
-  const active = defs.filter(d =>
-    validPoints.some(p => (p.result.indices[d.key]?.recent_series?.length ?? 0) > 0)
-  );
-  if (!active.length) { container.innerHTML = ""; return; }
-
-  const legendHtml = !single
-    ? `<div class="chart-legend">` +
-      validPoints.map(p =>
-        `<span class="chart-legend-item">` +
-        `<span class="chart-legend-dot" style="background:${p.color}"></span>Pt.${p.id}` +
-        ` <span class="chart-legend-coord">${p.lat.toFixed(2)},${p.lon.toFixed(2)}</span>` +
-        `</span>`
-      ).join("") + `</div>`
-    : "";
-
-  container.innerHTML = active.map(d => `
-    <div class="chart-card">
-      <div class="chart-header">
-        <span>${d.label} — tendencia + banda estacional${!single ? " · " + validPoints.length + " puntos" : ""}</span>
-        <div class="chart-timerange" id="tr-${d.key}">
-          <button class="tr-btn" data-m="6">6M</button>
-          <button class="tr-btn active" data-m="12">1A</button>
-          <button class="tr-btn" data-m="24">2A</button>
-          <button class="tr-btn" data-m="0">MAX</button>
-        </div>
-      </div>
-      ${legendHtml}
-      <div class="chart-wrap" id="chart-${d.key}"></div>
-    </div>`).join("");
-
-  requestAnimationFrame(() => {
-    for (const d of active) {
-      // Build per-point data bundles
-      const pointData = validPoints
-        .map(p => ({
-          recent:  p.result.indices[d.key]?.recent_series || [],
-          clim:    p.result.indices[d.key]?.climatology   || {},
-          color:   p.color,
-          ptId:    p.id,
-        }))
-        .filter(pd => pd.recent.length > 0);
-      if (pointData.length) plotSeasonalChart(d.key, pointData, single, d.bandColor);
-    }
-  });
-}
-
-/**
- * Plot a seasonal-band chart for one indicator.
- * For single-point: draws p10/p25/p50/p75/p90 bands + actual line.
- * For multi-point: draws bands from first/active point + one actual line per point.
- */
-function plotSeasonalChart(key, pointData, single, bandColor) {
-  const el = document.getElementById(`chart-${key}`);
-  if (!el || !pointData.length) return;
-  if (_lwCharts[key]) { try { _lwCharts[key].remove(); } catch (_) {} }
-  el.innerHTML = "";
-
-  const chart = LightweightCharts.createChart(el, {
-    layout:     { background: { type: "solid", color: "#0e1520" }, textColor: "#7a90aa", fontSize: 10 },
-    grid:       { vertLines: { color: "#1c2d42", style: 1 }, horzLines: { color: "#1c2d42", style: 1 } },
-    crosshair:  { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor: "#243650", scaleMargins: { top: 0.10, bottom: 0.10 } },
-    timeScale:  { borderColor: "#243650", fixLeftEdge: true, fixRightEdge: true },
-    width:  el.clientWidth || 400,
-    height: 240,
-  });
-  _lwCharts[key] = chart;
-  new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth })).observe(el);
-
-  // ── Seasonal bands (use the first/active point's climatology) ──
-  const refPoint = pointData[0];
-  const clim     = refPoint.clim;
-
-  // Helper: build a series from recent dates using a climatology percentile
-  function bandSeries(recent, pctKey) {
-    return recent.map(pt => {
-      const month = new Date(pt.date).getMonth() + 1;
-      const val   = clim[month]?.[pctKey];
-      return val !== null && val !== undefined ? { time: pt.date, value: val } : null;
-    }).filter(Boolean);
-  }
-
-  const recent = refPoint.recent;
-
-  // p10 outer envelope (very faint line)
-  const s10 = chart.addLineSeries({ color: hexRgba(bandColor, 0.15), lineWidth: 1,
-    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  s10.setData(bandSeries(recent, "p10"));
-
-  // p90 outer envelope (very faint line)
-  const s90 = chart.addLineSeries({ color: hexRgba(bandColor, 0.15), lineWidth: 1,
-    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  s90.setData(bandSeries(recent, "p90"));
-
-  // p25 IQR line (faint)
-  const s25 = chart.addLineSeries({ color: hexRgba(bandColor, 0.35), lineWidth: 1,
-    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  s25.setData(bandSeries(recent, "p25"));
-
-  // p75 IQR line (faint)
-  const s75 = chart.addLineSeries({ color: hexRgba(bandColor, 0.35), lineWidth: 1,
-    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  s75.setData(bandSeries(recent, "p75"));
-
-  // p50 median (dashed, more visible)
-  const s50 = chart.addLineSeries({
-    color: hexRgba(bandColor, 0.65), lineWidth: 1,
-    lineStyle: LightweightCharts.LineStyle.Dashed,
-    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
-  });
-  s50.setData(bandSeries(recent, "p50"));
-
-  // ── Actual value series — one per point ───────────────────────
-  for (const pd of pointData) {
-    const lineColor = single ? bandColor : pd.color;
-    const actual = chart.addLineSeries({
-      color:     lineColor,
-      lineWidth: 2,
-      priceLineVisible: false,
-      lastValueVisible: true,
-      crosshairMarkerVisible: true,
-    });
-    actual.setData(pd.recent.map(pt => ({ time: pt.date, value: pt.value })));
-
-    // Mark current value with a circle at the last point
-    if (pd.recent.length > 0) {
-      const last = pd.recent[pd.recent.length - 1];
-      actual.setMarkers([{
-        time: last.date, position: "inBar", color: lineColor,
-        shape: "circle", size: 1.2,
-      }]);
-    }
-  }
-
-  // ── Time-range control ────────────────────────────────────────
-  const applyRange = (months) => {
-    if (months === 0) {
-      chart.timeScale().fitContent();
-    } else {
-      const to   = new Date().toISOString().slice(0, 10);
-      const from = new Date(Date.now() - months * 30.44 * 24 * 3600e3).toISOString().slice(0, 10);
-      try { chart.timeScale().setVisibleRange({ from, to }); } catch (_) {}
-    }
-  };
-
-  chart.timeScale().fitContent();
-  setTimeout(() => applyRange(12), 60);   // default: 1-year view
-
-  document.querySelectorAll(`#tr-${key} .tr-btn`).forEach(btn => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(`#tr-${key} .tr-btn`).forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      const m = parseInt(btn.dataset.m, 10);
-      applyRange(m);
-    });
-  });
 }
 
 // ── Index card ────────────────────────────────────────────────
@@ -753,10 +512,6 @@ function renderSocio(socio) {
       <div class="socio-cell">
         <div class="socio-cell-label">Contexto térmico</div>
         <div class="socio-cell-body">${esc(socio.thermal)}</div>
-      </div>
-      <div class="socio-cell">
-        <div class="socio-cell-label">Contexto macro (estimado)</div>
-        <div class="socio-cell-body">${esc(socio.macro)}</div>
       </div>
     </div>
     <div class="causality-box" role="note" aria-label="Cadena causal de impacto">

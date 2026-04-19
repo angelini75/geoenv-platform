@@ -12,7 +12,7 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-3.1-flash-lite-preview"   # cost-efficient, free-tier compatible
+MODEL = "gemini-2.5-flash"   # stable, widely available
 
 MONTH_NAMES = {
     1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
@@ -257,7 +257,6 @@ def build_llm_payload(data: dict) -> dict:
             "recurso_hidrico":         socio["water"],
             "precipitacion":           socio["precipitation"],
             "contexto_termico":        socio["thermal"],
-            "macro_estimado":          socio["macro"],
             "cadena_causalidad":       socio["causality_chain"],
             "supuestos":               socio["assumptions"],
         },

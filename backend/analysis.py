@@ -523,8 +523,6 @@ def _socio(lat, lon, scale, idx: dict) -> dict:
         else "Temperatura superficial dentro del rango estacional esperado."
     )
 
-    macro = _load_macro()   # R-012: loaded from macro_context.json (versioned, with staleness alert)
-
     if lst_z < -2.0:
         causality = (f"Anomalía térmica fría (LST {lst_z:.2f}σ estacional) → riesgo de heladas en {region} "
                      f"→ posible daño foliar → reducción de rendimiento → presión sobre ingresos rurales.")
@@ -546,7 +544,7 @@ def _socio(lat, lon, scale, idx: dict) -> dict:
     return {
         "region": region, "season": season,
         "agriculture": {"assessment": ag, "yield_impact": yield_impact, "crops_at_risk": crops},
-        "water": water, "precipitation": precip_note, "thermal": thermal, "macro": macro,
+        "water": water, "precipitation": precip_note, "thermal": thermal,
         "causality_chain": causality,
         "assumptions": [
             "Baseline histórico MODIS 2004-2024 (20 años). Z-scores ajustados estacionalmente por mes calendario.",
@@ -556,7 +554,6 @@ def _socio(lat, lon, scale, idx: dict) -> dict:
             "VCI/TCI/VHI climatologías derivadas de las curvas estacionales de NDVI y LST.",
             "NDWI formula Gao 1996 (NIR-SWIR): sensible a humedad de canopeo.",
             "Precipitación acumulada fuente CHIRPS (resolución 5.5 km, ~5 días latencia).",
-            "Datos macroeconómicos son proxies estimados; ver macro_context.json para fecha de actualización.",
         ],
     }
 
