@@ -1,21 +1,20 @@
 /* =============================================================
-   GeoEnv Platform v3 — Frontend logic
-   Multi-point analysis · Market context · ET / Soil Moisture
+   GeoEnv Platform v3.2 — Frontend logic
+   Multi-point · Chart-first time control · ET / SM / Market
    ============================================================= */
 
-const API_BASE = window.location.origin;
+const API_BASE   = window.location.origin;
+const FIXED_SCALE = "1m";   // time-range lives IN the chart, not the panel
 
 // ── State ──────────────────────────────────────────────────────
 const state = {
-  points:   [],     // [{ id, lat, lon, color, marker, result }]
-  scale:    "1m",
-  loading:  false,
-  nextId:   1,
-  activeId: null,   // ID of point whose results are currently shown
+  points:     [],   // [{ id, lat, lon, color, marker, result }]
+  loading:    false,
+  nextId:     1,
+  activeId:   null,
   marketData: null,
 };
 
-// Colors cycling through 5 positions (accent, green, yellow, orange, red)
 const POINT_COLORS = ["#3b9eff", "#23d18b", "#e5b93c", "#f07b3a", "#e8425a"];
 
 // ── Map setup ──────────────────────────────────────────────────
@@ -36,23 +35,23 @@ L.tileLayer(
 
 setTimeout(() => map.invalidateSize(), 200);
 
-// Argentina bounding box guide
+// Argentina bounding-box guide — interactive:false so it NEVER absorbs clicks
 L.rectangle([[-55.1, -73.6], [-21.8, -53.4]], {
-  color: "#3b9eff", weight: 1, fill: false, dashArray: "5 5", opacity: 0.4,
+  color: "#3b9eff", weight: 1, fill: false,
+  dashArray: "5 5", opacity: 0.4,
+  interactive: false,           // ← fix: never steal map-click events
 }).addTo(map);
 
 // ── Marker helpers ─────────────────────────────────────────────
 function makeMarkerIcon(id, color) {
   return L.divIcon({
     className: "",
-    html: `<div style="
-      width:22px;height:22px;border-radius:50%;
-      background:${color};border:3px solid #fff;
-      box-shadow:0 0 14px ${color}bb;
-      display:flex;align-items:center;justify-content:center;
-      font-size:11px;font-weight:700;color:#000;
-      font-family:'Inter',sans-serif;line-height:1;
-    ">${id}</div>`,
+    html: `<div style="width:22px;height:22px;border-radius:50%;`
+        + `background:${color};border:3px solid #fff;`
+        + `box-shadow:0 0 14px ${color}bb;`
+        + `display:flex;align-items:center;justify-content:center;`
+        + `font-size:11px;font-weight:700;color:#000;`
+        + `font-family:'Inter',sans-serif;line-height:1;">${id}</div>`,
     iconAnchor: [11, 11],
   });
 }
@@ -60,10 +59,9 @@ function makeMarkerIcon(id, color) {
 // ── Point management ───────────────────────────────────────────
 function addPoint(lat, lon) {
   if (state.points.length >= 5) return;
-  const id    = state.nextId++;
-  const color = POINT_COLORS[(id - 1) % 5];
+  const id     = state.nextId++;
+  const color  = POINT_COLORS[(id - 1) % 5];
   const marker = L.marker([lat, lon], { icon: makeMarkerIcon(id, color) }).addTo(map);
-  // Click on marker = remove it
   marker.on("click", (e) => { L.DomEvent.stop(e); removePoint(id); });
   state.points.push({ id, lat, lon, color, marker, result: null });
   state.activeId = id;
@@ -75,7 +73,6 @@ function removePoint(id) {
   if (idx === -1) return;
   state.points[idx].marker.remove();
   state.points.splice(idx, 1);
-  // Switch active to last point with results, or last point, or null
   if (state.activeId === id) {
     const withResult = [...state.points].reverse().find(p => p.result && !p.result._error);
     state.activeId = withResult
@@ -85,7 +82,10 @@ function removePoint(id) {
   updateControlPanel();
   const hasResults = state.points.some(p => p.result && !p.result._error);
   if (hasResults) {
-    renderActivePoint();
+    renderPointTabs();
+    renderAllCharts();           // update charts without the removed point
+    const ap = state.points.find(p => p.id === state.activeId);
+    if (ap?.result && !ap.result._error) renderIndexSections(ap.result);
   } else if (state.points.length === 0) {
     document.getElementById("dashboard").classList.remove("visible");
     document.getElementById("dashboard").style.display = "none";
@@ -96,7 +96,12 @@ function removePoint(id) {
 function setActivePoint(id) {
   state.activeId = id;
   updateControlPanel();
-  renderActivePoint();
+  renderPointTabs();
+  const point = state.points.find(p => p.id === id);
+  if (!point) return;
+  if (point.result?._error) { showDashboardError(point.result._error); return; }
+  if (point.result) renderIndexSections(point.result);
+  // charts stay as-is — they already show all points
 }
 
 // ── Control panel ──────────────────────────────────────────────
@@ -106,6 +111,8 @@ function updateControlPanel() {
   const countEl = document.getElementById("points-count");
   const btn     = document.getElementById("btn-analyze");
 
+  if (!listEl || !btn) return;   // guard: DOM not ready yet
+
   countEl.textContent = n > 0 ? `(${n}/5)` : "";
 
   if (n === 0) {
@@ -113,8 +120,7 @@ function updateControlPanel() {
   } else {
     listEl.innerHTML = state.points.map(p => `
       <div class="point-row${p.id === state.activeId ? " is-active" : ""}${p.result && !p.result._error ? " has-result" : ""}"
-           role="listitem"
-           onclick="setActivePoint(${p.id})">
+           role="listitem" onclick="setActivePoint(${p.id})">
         <span class="point-badge" style="background:${p.color}">${p.id}</span>
         <span class="point-coord-pair">
           <span class="point-coord">${p.lat.toFixed(4)}</span>
@@ -131,37 +137,24 @@ function updateControlPanel() {
       </div>`).join("");
   }
 
-  btn.disabled = n === 0 || state.loading;
+  btn.disabled = (n === 0) || state.loading;
   btn.textContent = state.loading ? "Analizando…"
-    : n === 0 ? "Seleccione un punto"
-    : n === 1 ? "Analizar punto"
+    : n === 0   ? "Seleccione un punto"
+    : n === 1   ? "Analizar punto"
     : `Analizar ${n} puntos`;
 }
 
-// ── Map click ─────────────────────────────────────────────────
+// ── Map click ──────────────────────────────────────────────────
 map.on("click", ({ latlng }) => {
   const { lat, lng } = latlng;
+  // Argentina bounding box guard
   if (lat < -55.1 || lat > -21.8 || lng < -73.6 || lng > -53.4) return;
   if (state.loading) return;
   if (state.points.length >= 5) return;
-  const la = parseFloat(lat.toFixed(5));
-  const lo = parseFloat(lng.toFixed(5));
-  addPoint(la, lo);
-  document.getElementById("btn-analyze").disabled = false;
+  addPoint(parseFloat(lat.toFixed(5)), parseFloat(lng.toFixed(5)));
 });
 
-// ── Scale buttons ──────────────────────────────────────────────
-document.querySelectorAll(".scale-btn").forEach(btn => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".scale-btn").forEach(b => {
-      b.classList.remove("active"); b.setAttribute("aria-pressed", "false");
-    });
-    btn.classList.add("active"); btn.setAttribute("aria-pressed", "true");
-    state.scale = btn.dataset.scale;
-  });
-});
-
-// ── Analyze ───────────────────────────────────────────────────
+// ── Analyze button ─────────────────────────────────────────────
 document.getElementById("btn-analyze").addEventListener("click", () => {
   if (state.points.length === 0 || state.loading) return;
   runAnalysis();
@@ -173,18 +166,17 @@ async function runAnalysis() {
   showDashboard();
   showGlobalSpinner();
 
-  // Analyze points sequentially (GEE quota protection)
   for (const point of state.points) {
-    if (point.result && !point.result._error) continue; // skip already done
-    updateControlPanel(); // show spinner on this point
+    if (point.result && !point.result._error) continue;   // skip cached
+    updateControlPanel();   // show spinner on this point row
     try {
       const res = await fetch(`${API_BASE}/analyze`, {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lat: point.lat, lon: point.lon, scale: state.scale }),
+        body:    JSON.stringify({ lat: point.lat, lon: point.lon, scale: FIXED_SCALE }),
       });
       if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
+        const err  = await res.json().catch(() => ({}));
         point.result = { _error: err.detail || `HTTP ${res.status}` };
       } else {
         point.result = await res.json();
@@ -197,11 +189,10 @@ async function runAnalysis() {
 
   state.loading = false;
 
-  // Activate first successful result
   const first = state.points.find(p => p.result && !p.result._error);
   if (first) {
     state.activeId = first.id;
-    renderActivePoint();
+    renderDashboardFull();
     fetchMarketData();
   } else {
     const errMsg = state.points.map(p => p.result?._error).filter(Boolean).join("; ");
@@ -211,7 +202,7 @@ async function runAnalysis() {
   updateControlPanel();
 }
 
-// ── Dashboard ─────────────────────────────────────────────────
+// ── Dashboard orchestration ────────────────────────────────────
 function showDashboard() {
   const d = document.getElementById("dashboard");
   d.style.display = "";
@@ -219,8 +210,21 @@ function showDashboard() {
   d.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+function renderDashboardFull() {
+  clearInterval(document._spinnerTicker);
+  renderPointTabs();
+
+  const point = state.points.find(p => p.id === state.activeId);
+  if (!point?.result || point.result._error) return;
+
+  renderIndexSections(point.result);   // per-point: banner, cards, precip, socio
+  renderAllCharts();                   // ALL points: candlestick series per index
+  if (state.marketData) renderMarket(state.marketData);
+}
+
+// ── Spinner & section clearing ─────────────────────────────────
 function showGlobalSpinner() {
-  clearSections();
+  clearAllSections();
   document.getElementById("sit-banner").innerHTML = `
     <div class="spinner-wrap">
       <div class="spin-ring" role="status" aria-label="Cargando análisis"></div>
@@ -248,42 +252,53 @@ function showGlobalSpinner() {
   }, 2800);
 }
 
-function clearSections() {
-  ["sit-banner","grid-veg","charts-veg","grid-water","charts-water",
-   "grid-thermal","charts-thermal","grid-hydro","precip-card",
-   "static-ctx-bar","socio-section"].forEach(id => {
+/** Clear everything — called before a new analysis run */
+function clearAllSections() {
+  clearIndexSections();
+  // Destroy chart instances and clear chart containers
+  ["charts-veg","charts-water","charts-thermal"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.innerHTML = "";
   });
-  document.getElementById("section-hydro").style.display = "none";
-  document.getElementById("static-ctx-bar").style.display = "none";
+  Object.keys(_lwCharts).forEach(k => {
+    try { _lwCharts[k].remove(); } catch (_) {}
+    delete _lwCharts[k];
+  });
+}
+
+/** Clear only per-point content — called on tab switch */
+function clearIndexSections() {
+  ["sit-banner","grid-veg","grid-water","grid-thermal","grid-hydro",
+   "precip-card","static-ctx-bar","socio-section"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = "";
+  });
+  const s = document.getElementById("section-hydro");
+  const b = document.getElementById("static-ctx-bar");
+  if (s) s.style.display = "none";
+  if (b) b.style.display = "none";
+  const btnR = document.getElementById("btn-report");
+  const body = document.getElementById("report-body");
+  if (btnR) btnR.disabled = true;
+  if (body) body.innerHTML = `<span style="color:var(--text-dim);font-size:.77rem">Haga clic en "Generar Informe" para el análisis narrativo completo.</span>`;
 }
 
 function showDashboardError(msg) {
-  clearSections();
+  clearIndexSections();
   document.getElementById("sit-banner").innerHTML = `
     <div class="error-wrap" role="alert">
       <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#e8425a" stroke-width="1.5">
-        <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/>
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="12" y1="8" x2="12" y2="12"/>
         <circle cx="12" cy="16" r=".5" fill="#e8425a"/>
       </svg>
       <p>${esc(msg)}</p>
     </div>`;
 }
 
-function renderActivePoint() {
-  clearInterval(document._spinnerTicker);
-  renderPointTabs();
-
-  const point = state.points.find(p => p.id === state.activeId);
-  if (!point) return;
-  if (point.result?._error) { showDashboardError(point.result._error); return; }
-  if (point.result) renderDashboard(point.result);
-}
-
-// ── Point tabs ────────────────────────────────────────────────
+// ── Point tabs ─────────────────────────────────────────────────
 function renderPointTabs() {
-  const bar = document.getElementById("point-tabs-bar");
+  const bar         = document.getElementById("point-tabs-bar");
   const withResults = state.points.filter(p => p.result);
   if (withResults.length <= 1) { bar.style.display = "none"; return; }
   bar.style.display = "flex";
@@ -298,15 +313,18 @@ function renderPointTabs() {
     </button>`).join("");
 }
 
-// ── Main render ───────────────────────────────────────────────
-function renderDashboard(data) {
+// ── Index sections — per active point ─────────────────────────
+function renderIndexSections(data) {
+  clearIndexSections();
   clearInterval(document._spinnerTicker);
   const { meta, indices: idx, situation_indicator, socioeconomic: socio, static_context } = data;
 
-  // Header chip — last active point
+  // Header chip
   const chip = document.getElementById("header-chip");
-  chip.textContent = `${meta.region} · ${scaleFmt(meta.scale)} · ${situation_indicator}`;
-  chip.classList.add("visible");
+  if (chip) {
+    chip.textContent = `${meta.region} · ${meta.current_month_name} · ${situation_indicator}`;
+    chip.classList.add("visible");
+  }
 
   // Situation banner
   document.getElementById("sit-banner").innerHTML = `
@@ -316,52 +334,34 @@ function renderDashboard(data) {
     <div class="sit-meta">
       <div><strong>${meta.region}</strong> · ${meta.season}</div>
       <div>${meta.period_start} → ${meta.period_end}</div>
-      <div>Escala: ${scaleFmt(meta.scale)}</div>
     </div>
-    <div class="sit-elapsed" aria-label="Tiempo de respuesta">⏱ ${meta.elapsed_seconds}s</div>`;
+    <div class="sit-elapsed" aria-label="Tiempo de respuesta">⏱ ${meta.elapsed_seconds ?? "—"}s</div>`;
 
-  // Vegetation
+  // Vegetation index cards
   document.getElementById("grid-veg").innerHTML =
     idxCard("NDVI", idx.ndvi, "Salud vegetal / biomasa") +
     idxCard("EVI",  idx.evi,  "Señal vegetal corregida") +
     idxCard("SAVI", idx.savi, "Veg. suelo expuesto");
-  renderCharts("charts-veg", [
-    { key:"ndvi", label:"NDVI", candles:idx.ndvi.candlesticks, color:"#23d18b" },
-    { key:"evi",  label:"EVI",  candles:idx.evi.candlesticks,  color:"#18c2b4" },
-    { key:"savi", label:"SAVI", candles:idx.savi.candlesticks, color:"#9b72f5" },
-  ]);
 
-  // Water & Drought
+  // Water & Drought index cards
   document.getElementById("grid-water").innerHTML =
     idxCard("NDWI",  idx.ndwi,  "Humedad canopeo") +
     idxCard("MNDWI", idx.mndwi, "Agua superficial") +
     idxCard("VCI",   idx.vci,   "Condición vs sequía") +
     idxCard("VHI",   idx.vhi,   "Salud ecosistema (VCI+TCI)/2");
-  renderCharts("charts-water", [
-    { key:"ndwi",  label:"NDWI",  candles:idx.ndwi.candlesticks,  color:"#3b9eff" },
-    { key:"mndwi", label:"MNDWI", candles:idx.mndwi.candlesticks, color:"#9b72f5" },
-    { key:"vci",   label:"VCI",   candles:idx.vci.candlesticks,   color:"#23d18b" },
-  ]);
 
-  // Thermal & Fire
+  // Thermal & Fire index cards
   document.getElementById("grid-thermal").innerHTML =
     idxCard("LST", idx.lst, "Temperatura superficial", "°C") +
     idxCard("TCI", idx.tci, "Condición térmica") +
     idxCard("NBR", idx.nbr, "Degradación / fuego");
-  renderCharts("charts-thermal", [
-    { key:"lst", label:"LST (°C)", candles:idx.lst.candlesticks, color:"#f07b3a" },
-    { key:"tci", label:"TCI",      candles:idx.tci.candlesticks, color:"#e5b93c" },
-    { key:"nbr", label:"NBR",      candles:idx.nbr.candlesticks, color:"#e8425a" },
-  ]);
 
   // ET + Soil Moisture (optional)
-  const hasET = idx.et  && idx.et.current  !== null;
-  const hasSM = idx.sm  && idx.sm.current  !== null;
+  const hasET = idx.et && idx.et.current !== null;
+  const hasSM = idx.sm && idx.sm.current !== null;
   if (hasET || hasSM) {
-    const hydroSection = document.getElementById("section-hydro");
-    const hydroGrid    = document.getElementById("grid-hydro");
-    hydroSection.style.display = "";
-    hydroGrid.innerHTML =
+    document.getElementById("section-hydro").style.display = "";
+    document.getElementById("grid-hydro").innerHTML =
       (hasET ? idxCard("ET", idx.et, "Evapotranspiración real", " mm/8d") : "") +
       (hasSM ? idxCard("SM", idx.sm, "Humedad superficial suelo", " mm")   : "");
   }
@@ -369,19 +369,171 @@ function renderDashboard(data) {
   // Precipitation
   renderPrecip(idx.precipitation);
 
-  // Static context (HAND, elevation, slope)
+  // Static context
   if (static_context) renderStaticContext(static_context);
 
   // Socioeconomic
   renderSocio(socio);
 
-  // Enable report
-  document.getElementById("btn-report").disabled = false;
-  document.getElementById("report-body").innerHTML =
-    `<span style="color:var(--text-dim);font-size:.77rem">Haga clic en "Generar Informe" para el análisis narrativo completo.</span>`;
+  // Enable report button
+  const btnR = document.getElementById("btn-report");
+  if (btnR) btnR.disabled = false;
 
   // Show market if already loaded
   if (state.marketData) renderMarket(state.marketData);
+}
+
+// ── Charts — ALL valid points overlaid ────────────────────────
+let _lwCharts = {};
+
+const CHART_GROUPS = [
+  { containerId: "charts-veg",
+    defs: [{ key:"ndvi", label:"NDVI" }, { key:"evi", label:"EVI" }, { key:"savi", label:"SAVI" }] },
+  { containerId: "charts-water",
+    defs: [{ key:"ndwi", label:"NDWI" }, { key:"mndwi", label:"MNDWI" }, { key:"vci", label:"VCI" }] },
+  { containerId: "charts-thermal",
+    defs: [{ key:"lst", label:"LST (°C)" }, { key:"tci", label:"TCI" }, { key:"nbr", label:"NBR" }] },
+];
+
+function renderAllCharts() {
+  const valid  = state.points.filter(p => p.result && !p.result._error);
+  if (!valid.length) return;
+  const single = valid.length === 1;
+  for (const g of CHART_GROUPS) renderChartGroup(g.containerId, g.defs, valid, single);
+}
+
+function renderChartGroup(containerId, defs, validPoints, single) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  // Keep only defs where ≥1 point has candle data
+  const active = defs.filter(d =>
+    validPoints.some(p => (p.result.indices[d.key]?.candlesticks?.length ?? 0) > 0)
+  );
+  if (!active.length) { container.innerHTML = ""; return; }
+
+  const legendHtml = !single
+    ? `<div class="chart-legend">` +
+      validPoints.map(p =>
+        `<span class="chart-legend-item">` +
+        `<span class="chart-legend-dot" style="background:${p.color}"></span>Pt.${p.id}` +
+        ` <span class="chart-legend-coord">${p.lat.toFixed(2)},${p.lon.toFixed(2)}</span>` +
+        `</span>`
+      ).join("") + `</div>`
+    : "";
+
+  container.innerHTML = active.map(d => `
+    <div class="chart-card">
+      <div class="chart-header">
+        <span>${d.label} — Velas mensuales${!single ? " · " + validPoints.length + " puntos" : ""}</span>
+        <div class="chart-timerange" id="tr-${d.key}">
+          <button class="tr-btn" data-m="3">3M</button>
+          <button class="tr-btn" data-m="6">6M</button>
+          <button class="tr-btn active" data-m="12">1A</button>
+          <button class="tr-btn" data-m="36">MAX</button>
+        </div>
+      </div>
+      ${legendHtml}
+      <div class="chart-wrap" id="chart-${d.key}"></div>
+    </div>`).join("");
+
+  requestAnimationFrame(() => {
+    for (const d of active) {
+      const series = validPoints
+        .map(p => ({
+          candles: p.result.indices[d.key]?.candlesticks || [],
+          color:   p.color,
+          ptId:    p.id,
+        }))
+        .filter(s => s.candles.length > 0);
+      plotMultiCandle(d.key, series, single);
+    }
+  });
+}
+
+// hex #rrggbb → rgba(r,g,b,alpha)
+function hexRgba(hex, alpha) {
+  const r = parseInt(hex.slice(1,3), 16);
+  const g = parseInt(hex.slice(3,5), 16);
+  const b = parseInt(hex.slice(5,7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function plotMultiCandle(key, pointSeries, single) {
+  const el = document.getElementById(`chart-${key}`);
+  if (!el || !pointSeries.length) return;
+  if (_lwCharts[key]) { try { _lwCharts[key].remove(); } catch (_) {} }
+  el.innerHTML = "";
+
+  const chart = LightweightCharts.createChart(el, {
+    layout:     { background: { type: "solid", color: "#0e1520" }, textColor: "#7a90aa", fontSize: 10 },
+    grid:       { vertLines: { color: "#1c2d42", style: 1 }, horzLines: { color: "#1c2d42", style: 1 } },
+    crosshair:  { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: "#243650", scaleMargins: { top: 0.08, bottom: 0.08 } },
+    timeScale:  { borderColor: "#243650", fixLeftEdge: true, fixRightEdge: true },
+    width:  el.clientWidth  || 400,
+    height: 230,
+  });
+  _lwCharts[key] = chart;
+  new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth })).observe(el);
+
+  for (const ps of pointSeries) {
+    // Single-point: classic green/red. Multi-point: each point's own color.
+    const upColor   = single ? "#23d18b"              : ps.color;
+    const downColor = single ? "#e8425a"              : hexRgba(ps.color, 0.40);
+    const wickUp    = single ? "#23d18b"              : ps.color;
+    const wickDown  = single ? "#e8425a"              : hexRgba(ps.color, 0.65);
+
+    const cs = chart.addCandlestickSeries({
+      upColor, downColor,
+      borderUpColor:   upColor,
+      borderDownColor: downColor,
+      wickUpColor:     wickUp,
+      wickDownColor:   wickDown,
+    });
+
+    cs.setData(ps.candles.map(c => ({
+      time: c.period,    // "YYYY-MM-DD" — Lightweight Charts accepts string dates
+      open: c.open, high: c.high, low: c.low, close: c.close,
+    })));
+
+    // Anomaly markers (z-score dots)
+    const markers = ps.candles
+      .filter(c => c.z_close !== null && Math.abs(c.z_close) >= 1.5)
+      .map(c => ({
+        time:     c.period,
+        position: c.z_close > 0 ? "aboveBar" : "belowBar",
+        color:    Math.abs(c.z_close) >= 2.5 ? "#e8425a" : "#e5b93c",
+        shape:    "circle", size: 0.8,
+        text:     `${c.z_close > 0 ? "+" : ""}${c.z_close.toFixed(1)}σ`,
+      }))
+      .sort((a, b) => a.time.localeCompare(b.time));
+    if (markers.length) cs.setMarkers(markers);
+  }
+
+  // Time-range control
+  const applyRange = (months) => {
+    if (months === 0) {
+      chart.timeScale().fitContent();
+    } else {
+      const to   = new Date().toISOString().slice(0, 10);
+      const from = new Date(Date.now() - months * 30.44 * 24 * 3600e3).toISOString().slice(0, 10);
+      try { chart.timeScale().setVisibleRange({ from, to }); } catch (_) {}
+    }
+  };
+
+  // Default: 1-year view
+  chart.timeScale().fitContent();
+  setTimeout(() => applyRange(12), 60);
+
+  // Wire up the time-range buttons for this chart
+  document.querySelectorAll(`#tr-${key} .tr-btn`).forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(`#tr-${key} .tr-btn`).forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      applyRange(parseInt(btn.dataset.m, 10));
+    });
+  });
 }
 
 // ── Index card ────────────────────────────────────────────────
@@ -425,68 +577,6 @@ function idxCard(name, d, desc, unit = "") {
       <div class="z-fill" style="width:${zW}%;background:${ac.color}"></div>
     </div>
   </div>`;
-}
-
-// ── Charts ────────────────────────────────────────────────────
-const _lwCharts = {};
-
-function renderCharts(containerId, series) {
-  const active = series.filter(s => s.candles && s.candles.length > 0);
-  const container = document.getElementById(containerId);
-  container.innerHTML = active.map(s => {
-    const first = s.candles[0]?.period?.slice(0, 7) ?? "";
-    const last  = s.candles[s.candles.length - 1]?.period?.slice(0, 7) ?? "";
-    return `
-      <div class="chart-card">
-        <div class="chart-header">
-          <span>${s.label} — Velas mensuales</span>
-          <span>${first} → ${last} · ${s.candles.length} meses</span>
-        </div>
-        <div class="chart-wrap" id="chart-${s.key}"></div>
-      </div>`;
-  }).join("");
-
-  requestAnimationFrame(() => active.forEach(s => plotCandleLW(s.key, s.candles, s.color)));
-}
-
-function plotCandleLW(key, candles, accentColor) {
-  const el = document.getElementById(`chart-${key}`);
-  if (!el || !candles.length) return;
-  if (_lwCharts[key]) { try { _lwCharts[key].remove(); } catch (_) {} }
-  el.innerHTML = "";
-
-  const chart = LightweightCharts.createChart(el, {
-    layout: { background: { type: "solid", color: "#0e1520" }, textColor: "#7a90aa", fontSize: 10 },
-    grid: { vertLines: { color: "#1c2d42", style: 1 }, horzLines: { color: "#1c2d42", style: 1 } },
-    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor: "#243650", scaleMargins: { top: 0.08, bottom: 0.08 } },
-    timeScale: { borderColor: "#243650", fixLeftEdge: true, fixRightEdge: true },
-    width: el.clientWidth || 400, height: el.clientHeight || 230,
-  });
-  _lwCharts[key] = chart;
-  new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth })).observe(el);
-
-  const series = chart.addCandlestickSeries({
-    upColor:"#23d18b", downColor:"#e8425a",
-    borderUpColor:"#23d18b", borderDownColor:"#e8425a",
-    wickUpColor:"#23d18b", wickDownColor:"#e8425a",
-  });
-  series.setData(candles.map(c => ({
-    time: c.period, open: c.open, high: c.high, low: c.low, close: c.close,
-  })));
-
-  const markers = candles
-    .filter(c => c.z_close !== null && Math.abs(c.z_close) >= 1.5)
-    .map(c => ({
-      time: c.period,
-      position: c.z_close > 0 ? "aboveBar" : "belowBar",
-      color: Math.abs(c.z_close) >= 2.5 ? "#e8425a" : "#e5b93c",
-      shape: "circle", size: 1,
-      text: `z ${c.z_close > 0 ? "+" : ""}${c.z_close.toFixed(1)}σ`,
-    })).sort((a, b) => a.time.localeCompare(b.time));
-  if (markers.length) series.setMarkers(markers);
-
-  chart.timeScale().fitContent();
 }
 
 // ── Precipitation card ────────────────────────────────────────
@@ -534,7 +624,7 @@ function renderStaticContext(ctx) {
 
 // ── Socioeconomic ─────────────────────────────────────────────
 function renderSocio(socio) {
-  const el = document.getElementById("socio-section");
+  const el    = document.getElementById("socio-section");
   const crops = socio.agriculture.crops_at_risk;
   const cropTags = crops.length
     ? crops.map(c => `<span class="crop-tag">${esc(c)}</span>`).join("")
@@ -593,45 +683,34 @@ function renderMarket(data) {
   const ts      = document.getElementById("market-ts");
   if (!data) return;
 
-  ts.textContent = data._timestamp ? `actualizado ${data._timestamp.slice(0,10)}` : "";
+  ts.textContent = data._timestamp ? `actualizado ${data._timestamp.slice(0, 10)}` : "";
 
   const cards = [];
 
-  // USD oficial
   const usd = data.usd_oficial;
-  if (usd?.venta) {
-    cards.push(marketCard("💵 Dólar oficial", `$${usd.venta.toLocaleString("es-AR")}`, "venta BNA", usd.fecha, "var(--accent)"));
-  }
+  if (usd?.venta)
+    cards.push(marketCard("💵 Dólar oficial", `$${usd.venta.toLocaleString("es-AR")}`,
+      "venta BNA", usd.fecha, "var(--accent)"));
 
-  // BCRA vars
   const vars = data.bcra_vars || {};
-  if (vars.badlar?.valor) {
-    cards.push(marketCard("📈 Tasa BADLAR", `${vars.badlar.valor.toFixed(1)}%`, "n.a. bancos privados", vars.badlar.fecha, "var(--yellow)"));
-  }
+  if (vars.badlar?.valor)
+    cards.push(marketCard("📈 Tasa BADLAR", `${vars.badlar.valor.toFixed(1)}%`,
+      "n.a. bancos privados", vars.badlar.fecha, "var(--yellow)"));
 
-  // Grain prices
   const granos = data.granos || {};
-  const grainDefs = [
-    { key: "soja_fas",  icon: "🌱", label: "Soja FAS" },
-    { key: "maiz_fas",  icon: "🌽", label: "Maíz FAS" },
+  for (const { key, icon, label } of [
+    { key: "soja_fas",  icon: "🌱", label: "Soja FAS"  },
+    { key: "maiz_fas",  icon: "🌽", label: "Maíz FAS"  },
     { key: "trigo_fas", icon: "🌾", label: "Trigo FAS" },
-  ];
-  for (const g of grainDefs) {
-    const v = granos[g.key];
-    if (v?.valor) {
-      cards.push(marketCard(
-        `${g.icon} ${g.label}`,
+  ]) {
+    const v = granos[key];
+    if (v?.valor)
+      cards.push(marketCard(`${icon} ${label}`,
         `$${v.valor.toLocaleString("es-AR")}`,
-        "$/tn teórico MAGyP", v.fecha, "var(--green)"
-      ));
-    }
+        "$/tn teórico MAGyP", v.fecha, "var(--green)"));
   }
 
-  if (!cards.length) {
-    section.style.display = "none";
-    return;
-  }
-
+  if (!cards.length) { section.style.display = "none"; return; }
   grid.innerHTML = cards.join("");
   section.style.display = "";
 }
@@ -655,9 +734,9 @@ async function generateReport() {
 
   const btn  = document.getElementById("btn-report");
   const body = document.getElementById("report-body");
-  btn.disabled = true;
+  btn.disabled    = true;
   btn.textContent = "Generando…";
-  body.innerHTML = `<span class="cursor"></span>`;
+  body.innerHTML  = `<span class="cursor"></span>`;
 
   let fullText   = "";
   let reportDone = false;
@@ -665,9 +744,9 @@ async function generateReport() {
 
   try {
     const res = await fetch(`${API_BASE}/report`, {
-      method: "POST",
+      method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(point.result),
+      body:    JSON.stringify(point.result),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
@@ -681,7 +760,7 @@ async function generateReport() {
       const lines = decoder.decode(value, { stream: true }).split("\n");
       for (const line of lines) {
         if (line.startsWith("event: ")) { currentEvent = line.slice(7).trim(); continue; }
-        if (line === "") { currentEvent = null; continue; }
+        if (line === "")               { currentEvent = null; continue; }
         if (!line.startsWith("data: ")) continue;
         const payload = line.slice(6).trim();
         if (payload === "[DONE]") { reportDone = true; break outer; }
@@ -694,43 +773,36 @@ async function generateReport() {
           fullText += parsed.chunk || "";
           body.innerHTML = marked.parse(fullText) + `<span class="cursor" aria-hidden="true"></span>`;
           body.scrollIntoView({ behavior: "smooth", block: "end" });
-        } catch { /* partial chunk */ }
+        } catch { /* partial chunk — ignore */ }
         currentEvent = null;
       }
     }
 
     if (fullText) body.innerHTML = marked.parse(fullText);
     if (reportError) {
-      body.innerHTML = `
-        <div class="report-error-banner" role="alert">
-          <strong>⚠ Error al generar el informe</strong><br>${esc(reportError)}
-        </div>` + (fullText ? marked.parse(fullText) : "");
+      body.innerHTML =
+        `<div class="report-error-banner" role="alert"><strong>⚠ Error al generar el informe</strong><br>${esc(reportError)}</div>` +
+        (fullText ? marked.parse(fullText) : "");
     }
     if (!reportDone && !reportError && fullText) {
-      body.innerHTML = marked.parse(fullText) + `
-        <div class="report-incomplete-banner" role="status">
-          ⚠ <em>El informe fue interrumpido antes de completarse.</em>
-        </div>`;
+      body.innerHTML = marked.parse(fullText) +
+        `<div class="report-incomplete-banner" role="status">⚠ <em>El informe fue interrumpido antes de completarse.</em></div>`;
     }
   } catch (e) {
     body.innerHTML = `<p style="color:var(--red)">Error: ${esc(e.message)}</p>`;
   } finally {
-    btn.disabled = false;
+    btn.disabled    = false;
     btn.textContent = "Regenerar Informe";
   }
 }
 
 // ── Helpers ───────────────────────────────────────────────────
 const INDIC_ICON = {
-  CRÍTICO:"🔴", ALERTA:"🟠", NORMAL:"🔵", FAVORABLE:"🟢", INDETERMINADO:"⚫"
+  CRÍTICO: "🔴", ALERTA: "🟠", NORMAL: "🔵", FAVORABLE: "🟢", INDETERMINADO: "⚫",
 };
-
-function scaleFmt(s) {
-  return { "1w":"1 semana","2w":"2 semanas","1m":"1 mes",
-           "2m":"2 meses","3m":"3 meses","6m":"6 meses","1y":"1 año" }[s] || s;
-}
 
 function esc(str) {
   if (!str) return "";
-  return str.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  return str.replace(/&/g,"&amp;").replace(/</g,"&lt;")
+            .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
