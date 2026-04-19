@@ -16,14 +16,14 @@ deploy:
 	@echo "==> Pulling latest code..."
 	sudo git -C $(VM_DIR) pull origin main
 	@echo "==> Rebuilding containers..."
-	$(COMPOSE) build --no-cache backend
+	$(COMPOSE) build --no-cache geoenv
 	$(COMPOSE) up -d
 	@echo "==> Done. Checking health..."
 	sleep 5
 	curl -s https://indicadores.soildecisions.com/health | python3 -m json.tool
 
 restart:
-	$(COMPOSE) restart backend
+	$(COMPOSE) restart geoenv
 	sleep 3
 	curl -s https://indicadores.soildecisions.com/health | python3 -m json.tool
 
@@ -44,7 +44,7 @@ doctor:
 	@test -f /opt/mi-stack/secrets/credentials.json && echo "✓ OK" \
 		|| echo "✗ MISSING — copy credentials.json to /opt/mi-stack/secrets/"
 	@printf "Docker running  ... "
-	@sudo docker compose -f $(VM_DIR)/docker-compose.yml ps --quiet backend | grep -q . \
+	@sudo docker compose -f $(VM_DIR)/docker-compose.yml ps --quiet geoenv | grep -q . \
 		&& echo "✓ running" || echo "✗ NOT running — run: make deploy"
 	@printf "Health endpoint ... "
 	@curl -sf https://indicadores.soildecisions.com/health | python3 -m json.tool \
