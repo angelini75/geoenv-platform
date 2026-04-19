@@ -4,7 +4,9 @@ Environmental analysis engine — Argentina.
 Data sources:
   MOD13Q1  : NDVI, EVI               (16-day, 250 m)
   MOD09A1  : NDWI, MNDWI, SAVI, NBR  (8-day, 500 m)
-  MOD11A2  : LST                      (8-day, 1 km)
+  MOD11A2  : LST Day + Night          (8-day, 1 km)
+  MOD16A2  : ET                       (8-day, 500 m)
+  SMAP     : Soil Moisture            (daily, 10 km)
   CHIRPS   : Precipitation            (daily, 5.5 km)
 
 Derived: VCI, TCI, VHI  (from NDVI + LST historical min/max)
@@ -12,7 +14,8 @@ Derived: VCI, TCI, VHI  (from NDVI + LST historical min/max)
 Baseline: 2004-2024 (20 years of MODIS).
 Z-scores are SEASONALLY ADJUSTED: each index is compared to the
 climatological mean for the SAME calendar month, not to an annual mean.
-Chart series: last 3 years of monthly OHLC candlesticks (per-month z-scores).
+Visualization: seasonal quantile bands (p10/p25/p50/p75/p90) per calendar month
+plus last 24 months of actual monthly values.
 GEE fetches run in parallel threads to minimize latency.
 """
 import ee
@@ -43,9 +46,9 @@ SCALE_DAYS = {
 }
 HIST_START      = "2004-01-01"   # 20-year MODIS baseline
 HIST_END        = "2024-12-31"
-SMAP_HIST_START = "2016-01-01"  # SMAP operational since April 2015
+SMAP_HIST_START = "2015-04-01"  # SMAP operational since April 2015
 SMAP_HIST_END   = "2024-12-31"
-CHART_YEARS     = 3              # monthly candle chart spans last N years
+RECENT_MONTHS   = 24             # recent trend series spans last N months
 GEE_TIMEOUT     = 45             # seconds — main 4 fetches
 GEE_OPT_TIMEOUT = 30             # seconds — optional indicators (ET, SM, static)
 
@@ -100,13 +103,16 @@ def _pct_dev(value, mean):
 
 def _classify(z) -> str:
     if z is None:
-        return "Sin datos"
-    a = abs(z)
-    if a < 1.0:
-        return "Normal"
-    if a < 1.5:
-        return "Anomalía moderada"
-    return "Anomalía extrema"
+        return "sin_datos"
+    if z < -1.5:
+        return "muy_bajo"
+    if z < -0.5:
+        return "bajo"
+    if z <= 0.5:
+        return "normal"
+    if z <= 1.5:
+        return "alto"
+    return "muy_alto"
 
 
 def _calendar_months(start: date, end: date) -> tuple[int, int]:
@@ -119,119 +125,82 @@ def _calendar_months(start: date, end: date) -> tuple[int, int]:
     return months[0], months[-1]
 
 
-def _direction(index: str, o: float, c: float) -> str:
-    if c > o:
-        labels = {
-            "ndvi": "Alcista (recuperación)", "evi": "Alcista (recuperación)",
-            "savi": "Alcista (recuperación)", "ndwi": "Alcista (recarga hídrica)",
-            "mndwi": "Alcista (agua superficial +)", "vci": "Alcista (condición vegetal +)",
-            "tci": "Alcista (condición térmica +)", "vhi": "Alcista (salud ecosistema +)",
-            "lst": "Alcista (estrés térmico)", "nbr": "Alcista (biomasa +)",
-        }
-        return labels.get(index, "Alcista")
-    elif c < o:
-        labels = {
-            "ndvi": "Bajista (estrés/degradación)", "evi": "Bajista (estrés/degradación)",
-            "savi": "Bajista (suelo expuesto +)", "ndwi": "Bajista (déficit hídrico)",
-            "mndwi": "Bajista (agua superficial −)", "vci": "Bajista (sequía agrícola)",
-            "tci": "Bajista (estrés térmico +)", "vhi": "Bajista (deterioro ecosistema)",
-            "lst": "Bajista (enfriamiento)", "nbr": "Bajista (degradación/fuego)",
-        }
-        return labels.get(index, "Bajista")
-    return "Neutro"
-
-
-# ---------------------------------------------------------------------------
-# Monthly OHLC candlesticks (seasonally adjusted z-scores per candle)
-# ---------------------------------------------------------------------------
-
-def _monthly_candles(series: list[dict], monthly_clim: dict,
-                     index: str) -> list[dict]:
+def _monthly_aggregate(series: list[dict]) -> list[dict]:
     """
-    Group a time-series into monthly OHLC candles.
-    Z-score of each candle close uses THAT month's climatology (seasonal adjustment).
-    Period format: YYYY-MM-DD (first day of month) — TradingView compatible.
+    Group a raw (8/16-day) series into monthly means.
+    Returns [{date: "YYYY-MM-01", value: float}] sorted by date.
     """
     if not series:
         return []
-
     groups: dict[str, list] = defaultdict(list)
     for pt in series:
         groups[pt["date"][:7]].append(pt["value"])
-
-    out = []
-    for ym in sorted(groups):
-        vals = groups[ym]
-        if not vals:
-            continue
-        month = int(ym[5:7])
-        o, c, h, lo = vals[0], vals[-1], max(vals), min(vals)
-
-        # Per-month climatology for seasonal z-score
-        m_stats = (monthly_clim or {}).get(month, {})
-        z = _zscore(c, m_stats.get("mean"), m_stats.get("std"))
-
-        out.append({
-            "period":         ym + "-01",
-            "open":           round(o,  5),
-            "close":          round(c,  5),
-            "high":           round(h,  5),
-            "low":            round(lo, 5),
-            "range":          round(h - lo, 5),
-            "direction":      _direction(index, o, c),
-            "z_close":        z,
-            "anomaly_class":  _classify(z),
-            "n_observations": len(vals),
-        })
-    return out
+    return [
+        {"date": ym + "-01", "value": round(sum(v) / len(v), 5)}
+        for ym, v in sorted(groups.items())
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Summarize one index using seasonal (per-month) climatology
 # ---------------------------------------------------------------------------
 
-def _summarize(cur_series: list[dict], chart_series: list[dict],
+def _summarize(cur_series: list[dict], recent_raw_series: list[dict],
                hist_alltime: dict, monthly_clim: dict,
-               index: str, scale: str,
-               current_override=None) -> dict:
+               index: str,
+               current_override=None,
+               current_date_override=None) -> dict:
     """
-    hist_alltime  : {mean, std, min, max, count} — used for min/max (VCI/TCI bounds)
-    monthly_clim  : {month_int: {"mean": x, "std": y}} — seasonally adjusted z-score
+    Build a seasonal-comparison summary for one environmental index.
+
+    cur_series          : raw series for the analysis window (for current value)
+    recent_raw_series   : raw series for last RECENT_MONTHS (for trend chart)
+    hist_alltime        : {mean, std, min, max, count} — all-time stats (VCI/TCI bounds)
+    monthly_clim        : {month_int: {mean, std, p10, p25, p50, p75, p90}}
+    current_override    : use this value instead of the last point in cur_series
+    current_date_override: use this date instead of the last point's date
     """
     val = (current_override if current_override is not None
            else (cur_series[-1]["value"] if cur_series else None))
+    cur_date = (current_date_override
+                or (cur_series[-1]["date"] if cur_series else None))
 
     cur_month = date.today().month
     m_stats   = (monthly_clim or {}).get(cur_month, {})
-    # Use `is not None` guard — a mean of 0.0 is falsy but valid (e.g. NDWI in arid zones)
+    # Guard: a mean of 0.0 is falsy but valid (e.g. NDWI in arid zones)
     clim_mean = m_stats["mean"] if m_stats.get("mean") is not None else hist_alltime.get("mean")
     clim_std  = m_stats["std"]  if m_stats.get("std")  is not None else hist_alltime.get("std")
 
     z = _zscore(val, clim_mean, clim_std)
 
-    candles = _monthly_candles(chart_series, monthly_clim, index)
+    # Build 12-month climatology dict with all percentile levels
+    climatology = {}
+    for m in range(1, 13):
+        md = (monthly_clim or {}).get(m, {})
+        climatology[m] = {
+            "mean": md.get("mean"),
+            "p10":  md.get("p10"),
+            "p25":  md.get("p25"),
+            "p50":  md.get("p50"),
+            "p75":  md.get("p75"),
+            "p90":  md.get("p90"),
+        }
 
-    # Compact seasonal curve: {month_int: mean} for LLM + frontend
-    seasonal_means = {
-        m: (monthly_clim[m]["mean"] if monthly_clim and m in monthly_clim else None)
-        for m in range(1, 13)
-    }
+    recent_series = _monthly_aggregate(recent_raw_series)
 
     return {
-        "current":         round(val, 5) if val is not None else None,
-        "hist_mean":       clim_mean,          # current-month seasonal mean
-        "hist_std":        clim_std,
-        "hist_min":        hist_alltime.get("min"),
-        "hist_max":        hist_alltime.get("max"),
-        "z_score":         z,
-        "pct_deviation":   _pct_dev(val, clim_mean),
-        "anomaly_class":   _classify(z),
-        "candlesticks":    candles,
-        "seasonal_curve":  seasonal_means,      # 12-month climatology means (used by reporter)
-        # R-011: monthly_clim removed — seasonal_curve already has the 12 means;
-        # the raw mean+std dict was redundant (~240 extra floats in the payload).
-        "n_observations":  len(cur_series),
-        "hist_n_images":   hist_alltime.get("count", 0),
+        "current":        round(val, 5) if val is not None else None,
+        "current_date":   cur_date,
+        "hist_mean":      clim_mean,
+        "hist_std":       clim_std,
+        "hist_min":       hist_alltime.get("min"),
+        "hist_max":       hist_alltime.get("max"),
+        "z_score":        z,
+        "pct_deviation":  _pct_dev(val, clim_mean),
+        "anomaly_class":  _classify(z),
+        "n_observations": len(cur_series),
+        "climatology":    climatology,    # 12-month seasonal quantile bands
+        "recent_series":  recent_series,  # last RECENT_MONTHS monthly means
     }
 
 
@@ -254,23 +223,44 @@ def _tci(lst_cur, hmin, hmax):
 
 
 def _derived_clim(base_clim: dict, hmin: float, hmax: float, invert: bool = False) -> dict:
-    """Propagate monthly climatology through VCI or TCI formula."""
+    """
+    Propagate monthly climatology (mean + all percentiles) through VCI or TCI formula.
+    For invert=True (TCI from LST): low LST → high TCI, so p10 and p90 swap.
+    """
     d = hmax - hmin
     if d == 0:
         return {}
+
+    def t(v):
+        if v is None:
+            return None
+        raw = (hmax - v) / d if invert else (v - hmin) / d
+        return round(max(0.0, min(1.0, raw)), 4)
+
     result = {}
     for m, stats in (base_clim or {}).items():
         mu = stats.get("mean")
         sd = stats.get("std")
-        if mu is None:
-            result[m] = {"mean": None, "std": None}
-        else:
-            vci_mu = (hmax - mu) / d if invert else (mu - hmin) / d
-            result[m] = {
-                "mean": round(max(0.0, min(1.0, vci_mu)), 4),
-                "std":  round(sd / d, 4) if sd else None,
-            }
+        result[m] = {
+            "mean": t(mu),
+            "std":  round(sd / d, 4) if sd is not None else None,
+            # When inverting (TCI): percentile order flips
+            "p10":  t(stats.get("p90" if invert else "p10")),
+            "p25":  t(stats.get("p75" if invert else "p25")),
+            "p50":  t(stats.get("p50")),
+            "p75":  t(stats.get("p25" if invert else "p75")),
+            "p90":  t(stats.get("p10" if invert else "p90")),
+        }
     return result
+
+
+def _safe_vhi_pct(v: dict, t: dict, pct: str):
+    """VHI = 0.5*VCI + 0.5*TCI — propagate one percentile level."""
+    vp = v.get(pct)
+    tp = t.get(pct)
+    if vp is None or tp is None:
+        return None
+    return round(max(0.0, min(1.0, 0.5 * vp + 0.5 * tp)), 4)
 
 
 def _vci_series(ndvi_series, hmin, hmax):
@@ -307,12 +297,15 @@ def _vhi_clim(vci_clim, tci_clim):
         if v.get("mean") is not None and t.get("mean") is not None:
             std_v = v.get("std") or 0.0
             std_t = t.get("std") or 0.0
-            # R-009: correct variance propagation for VHI = 0.5*VCI + 0.5*TCI.
-            # Assuming independence (conservative): sqrt(0.25*var_v + 0.25*var_t).
-            # The linear average (0.5*sd_v + 0.5*sd_t) would underestimate uncertainty.
             result[m] = {
                 "mean": round(0.5 * v["mean"] + 0.5 * t["mean"], 4),
+                # R-009: correct variance propagation (sqrt of sum of variances)
                 "std":  round(math.sqrt(0.25 * std_v**2 + 0.25 * std_t**2), 4),
+                "p10":  _safe_vhi_pct(v, t, "p10"),
+                "p25":  _safe_vhi_pct(v, t, "p25"),
+                "p50":  _safe_vhi_pct(v, t, "p50"),
+                "p75":  _safe_vhi_pct(v, t, "p75"),
+                "p90":  _safe_vhi_pct(v, t, "p90"),
             }
     return result
 
@@ -321,23 +314,24 @@ def _vhi_clim(vci_clim, tci_clim):
 # GEE fetch functions (parallel threads)
 # ---------------------------------------------------------------------------
 
-def _chart_range():
+def _recent_range():
+    """Last RECENT_MONTHS months for the trend series."""
     end = date.today()
-    return (end - relativedelta(years=CHART_YEARS)).isoformat(), end.isoformat()
+    return (end - relativedelta(months=RECENT_MONTHS)).isoformat(), end.isoformat()
 
 
 def _fetch_vegetation(lat, lon, start, end, cal):
     geom  = point_buffer(lat, lon, 500)
     col   = ee.ImageCollection("MODIS/061/MOD13Q1").map(scale_mod13q1)
     hist  = col.filterDate(HIST_START, HIST_END)
-    cs, ce = _chart_range()
+    rs, re = _recent_range()
     bands = ["NDVI", "EVI"]
     return {
-        "cur_series":   extract_series(col.filterDate(start, end), geom, 250, bands),
-        "hist_stats":   extract_stats(hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
-                                      geom, 250, bands),
-        "chart_series": extract_series(col.filterDate(cs, ce), geom, 250, bands),
-        "monthly_clim": extract_monthly_climatology(hist, geom, 250, bands),
+        "cur_series":    extract_series(col.filterDate(start, end), geom, 250, bands),
+        "hist_stats":    extract_stats(hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
+                                       geom, 250, bands),
+        "recent_series": extract_series(col.filterDate(rs, re), geom, 250, bands),
+        "monthly_clim":  extract_monthly_climatology(hist, geom, 250, bands),
     }
 
 
@@ -345,14 +339,14 @@ def _fetch_optical(lat, lon, start, end, cal):
     geom  = point_buffer(lat, lon, 1000)
     col   = ee.ImageCollection("MODIS/061/MOD09A1").map(scale_mod09a1)
     hist  = col.filterDate(HIST_START, HIST_END)
-    cs, ce = _chart_range()
+    rs, re = _recent_range()
     bands = ["NDWI", "MNDWI", "SAVI", "NBR"]
     return {
-        "cur_series":   extract_series(col.filterDate(start, end), geom, 500, bands),
-        "hist_stats":   extract_stats(hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
-                                      geom, 500, bands),
-        "chart_series": extract_series(col.filterDate(cs, ce), geom, 500, bands),
-        "monthly_clim": extract_monthly_climatology(hist, geom, 500, bands),
+        "cur_series":    extract_series(col.filterDate(start, end), geom, 500, bands),
+        "hist_stats":    extract_stats(hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
+                                       geom, 500, bands),
+        "recent_series": extract_series(col.filterDate(rs, re), geom, 500, bands),
+        "monthly_clim":  extract_monthly_climatology(hist, geom, 500, bands),
     }
 
 
@@ -360,13 +354,13 @@ def _fetch_lst(lat, lon, start, end, cal):
     geom  = point_buffer(lat, lon, 2000)
     col   = ee.ImageCollection("MODIS/061/MOD11A2").map(scale_mod11a2)
     hist  = col.filterDate(HIST_START, HIST_END)
-    cs, ce = _chart_range()
+    rs, re = _recent_range()
     return {
-        "cur_series":   extract_series(col.filterDate(start, end), geom, 1000, ["LST"]),
-        "hist_stats":   extract_stats(hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
-                                      geom, 1000, ["LST"]),
-        "chart_series": extract_series(col.filterDate(cs, ce), geom, 1000, ["LST"]),
-        "monthly_clim": extract_monthly_climatology(hist, geom, 1000, ["LST"]),
+        "cur_series":    extract_series(col.filterDate(start, end), geom, 1000, ["LST"]),
+        "hist_stats":    extract_stats(hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
+                                       geom, 1000, ["LST"]),
+        "recent_series": extract_series(col.filterDate(rs, re), geom, 1000, ["LST"]),
+        "monthly_clim":  extract_monthly_climatology(hist, geom, 1000, ["LST"]),
     }
 
 
@@ -411,14 +405,14 @@ def _fetch_et(lat, lon, start, end, cal):
     geom  = point_buffer(lat, lon, 1000)
     col   = ee.ImageCollection("MODIS/061/MOD16A2GF").map(scale_mod16a2)
     hist  = col.filterDate(HIST_START, HIST_END)
-    cs, ce = _chart_range()
+    rs, re = _recent_range()
     return {
-        "cur_series":   extract_series(col.filterDate(start, end), geom, 500, ["ET"]),
-        "hist_stats":   extract_stats(
+        "cur_series":    extract_series(col.filterDate(start, end), geom, 500, ["ET"]),
+        "hist_stats":    extract_stats(
             hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
             geom, 500, ["ET"]),
-        "chart_series": extract_series(col.filterDate(cs, ce), geom, 500, ["ET"]),
-        "monthly_clim": extract_monthly_climatology(hist, geom, 500, ["ET"]),
+        "recent_series": extract_series(col.filterDate(rs, re), geom, 500, ["ET"]),
+        "monthly_clim":  extract_monthly_climatology(hist, geom, 500, ["ET"]),
     }
 
 
@@ -427,14 +421,14 @@ def _fetch_soil_moisture(lat, lon, start, end, cal):
     geom  = point_buffer(lat, lon, 10000)
     col   = ee.ImageCollection("NASA_USDA/HSL/SMAP10KM_soil_moisture").map(scale_smap)
     hist  = col.filterDate(SMAP_HIST_START, SMAP_HIST_END)
-    cs, ce = _chart_range()
+    rs, re = _recent_range()
     return {
-        "cur_series":   extract_series(col.filterDate(start, end), geom, 10000, ["ssm"]),
-        "hist_stats":   extract_stats(
+        "cur_series":    extract_series(col.filterDate(start, end), geom, 10000, ["ssm"]),
+        "hist_stats":    extract_stats(
             hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
             geom, 10000, ["ssm"]),
-        "chart_series": extract_series(col.filterDate(cs, ce), geom, 10000, ["ssm"]),
-        "monthly_clim": extract_monthly_climatology(hist, geom, 10000, ["ssm"]),
+        "recent_series": extract_series(col.filterDate(rs, re), geom, 10000, ["ssm"]),
+        "monthly_clim":  extract_monthly_climatology(hist, geom, 10000, ["ssm"]),
     }
 
 
@@ -648,20 +642,25 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
     ndvi_hist  = veg_data["hist_stats"]["NDVI"]
     lst_hist   = lst_data["hist_stats"]["LST"]
 
-    ndvi  = _summarize(veg_data["cur_series"]["NDVI"],  veg_data["chart_series"]["NDVI"],
-                       ndvi_hist, veg_data["monthly_clim"]["NDVI"],  "ndvi",  scale_label)
-    evi   = _summarize(veg_data["cur_series"]["EVI"],   veg_data["chart_series"]["EVI"],
-                       veg_data["hist_stats"]["EVI"],  veg_data["monthly_clim"]["EVI"],   "evi",   scale_label)
-    savi  = _summarize(opt_data["cur_series"]["SAVI"],  opt_data["chart_series"]["SAVI"],
-                       opt_data["hist_stats"]["SAVI"],  opt_data["monthly_clim"]["SAVI"],  "savi",  scale_label)
-    ndwi  = _summarize(opt_data["cur_series"]["NDWI"],  opt_data["chart_series"]["NDWI"],
-                       opt_data["hist_stats"]["NDWI"],  opt_data["monthly_clim"]["NDWI"],  "ndwi",  scale_label)
-    mndwi = _summarize(opt_data["cur_series"]["MNDWI"], opt_data["chart_series"]["MNDWI"],
-                       opt_data["hist_stats"]["MNDWI"], opt_data["monthly_clim"]["MNDWI"], "mndwi", scale_label)
-    nbr   = _summarize(opt_data["cur_series"]["NBR"],   opt_data["chart_series"]["NBR"],
-                       opt_data["hist_stats"]["NBR"],   opt_data["monthly_clim"]["NBR"],   "nbr",   scale_label)
-    lst   = _summarize(lst_data["cur_series"]["LST"],   lst_data["chart_series"]["LST"],
-                       lst_hist,                        lst_data["monthly_clim"]["LST"],   "lst",   scale_label)
+    # Helper: date of the most recent observation in a series
+    def _cur_date(series_dict, key):
+        s = series_dict.get(key, [])
+        return s[-1]["date"] if s else None
+
+    ndvi  = _summarize(veg_data["cur_series"]["NDVI"],  veg_data["recent_series"]["NDVI"],
+                       ndvi_hist, veg_data["monthly_clim"]["NDVI"],  "ndvi")
+    evi   = _summarize(veg_data["cur_series"]["EVI"],   veg_data["recent_series"]["EVI"],
+                       veg_data["hist_stats"]["EVI"],  veg_data["monthly_clim"]["EVI"],   "evi")
+    savi  = _summarize(opt_data["cur_series"]["SAVI"],  opt_data["recent_series"]["SAVI"],
+                       opt_data["hist_stats"]["SAVI"],  opt_data["monthly_clim"]["SAVI"],  "savi")
+    ndwi  = _summarize(opt_data["cur_series"]["NDWI"],  opt_data["recent_series"]["NDWI"],
+                       opt_data["hist_stats"]["NDWI"],  opt_data["monthly_clim"]["NDWI"],  "ndwi")
+    mndwi = _summarize(opt_data["cur_series"]["MNDWI"], opt_data["recent_series"]["MNDWI"],
+                       opt_data["hist_stats"]["MNDWI"], opt_data["monthly_clim"]["MNDWI"], "mndwi")
+    nbr   = _summarize(opt_data["cur_series"]["NBR"],   opt_data["recent_series"]["NBR"],
+                       opt_data["hist_stats"]["NBR"],   opt_data["monthly_clim"]["NBR"],   "nbr")
+    lst   = _summarize(lst_data["cur_series"]["LST"],   lst_data["recent_series"]["LST"],
+                       lst_hist,                        lst_data["monthly_clim"]["LST"],   "lst")
 
     # --- Derived indices ---
     vci_val = _vci(ndvi["current"], ndvi_hist["min"], ndvi_hist["max"])
@@ -672,30 +671,35 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
     tci_clim = _derived_clim(lst_data["monthly_clim"]["LST"],  lst_hist["min"],  lst_hist["max"],  invert=True)
     vhi_clim = _vhi_clim(vci_clim, tci_clim)
 
-    vci_chart = _vci_series(veg_data["chart_series"]["NDVI"], ndvi_hist["min"], ndvi_hist["max"])
-    tci_chart = _tci_series(lst_data["chart_series"]["LST"],  lst_hist["min"],  lst_hist["max"])
-    vhi_chart = _vhi_series(vci_chart, tci_chart)
+    vci_recent = _vci_series(veg_data["recent_series"]["NDVI"], ndvi_hist["min"], ndvi_hist["max"])
+    tci_recent = _tci_series(lst_data["recent_series"]["LST"],  lst_hist["min"],  lst_hist["max"])
+    vhi_recent = _vhi_series(vci_recent, tci_recent)
 
     # R-005: use mean=None/std=None so that when monthly_clim is unavailable
     # (e.g. hmax==hmin pixel → _derived_clim returns {}), _summarize falls back
-    # to None → z_score=None → anomaly_class="Sin datos" instead of a phantom
-    # z-score based on the meaningless 0.5±0.25 placeholder.
+    # to None → z_score=None → anomaly_class="sin_datos" instead of a phantom z-score.
     vci_alltime = {"mean": None, "std": None, "min": 0.0, "max": 1.0, "count": 0}
     tci_alltime = {"mean": None, "std": None, "min": 0.0, "max": 1.0, "count": 0}
     vhi_alltime = {"mean": None, "std": None, "min": 0.0, "max": 1.0, "count": 0}
 
-    vci = _summarize([], vci_chart, vci_alltime, vci_clim, "vci", scale_label, current_override=vci_val)
-    tci = _summarize([], tci_chart, tci_alltime, tci_clim, "tci", scale_label, current_override=tci_val)
-    vhi = _summarize([], vhi_chart, vhi_alltime, vhi_clim, "vhi", scale_label, current_override=vhi_val)
+    ndvi_cur_date = _cur_date(veg_data["cur_series"], "NDVI")
+    lst_cur_date  = _cur_date(lst_data["cur_series"], "LST")
+
+    vci = _summarize([], vci_recent, vci_alltime, vci_clim, "vci",
+                     current_override=vci_val, current_date_override=ndvi_cur_date)
+    tci = _summarize([], tci_recent, tci_alltime, tci_clim, "tci",
+                     current_override=tci_val, current_date_override=lst_cur_date)
+    vhi = _summarize([], vhi_recent, vhi_alltime, vhi_clim, "vhi",
+                     current_override=vhi_val, current_date_override=ndvi_cur_date)
 
     # --- Optional: ET (Evapotranspiración) ---
     et = None
     if et_data:
         try:
             et = _summarize(
-                et_data["cur_series"]["ET"],  et_data["chart_series"]["ET"],
+                et_data["cur_series"]["ET"],  et_data["recent_series"]["ET"],
                 et_data["hist_stats"]["ET"],  et_data["monthly_clim"]["ET"],
-                "et", scale_label,
+                "et",
             )
         except Exception as exc:
             logger.warning("ET summarize failed: %s", exc)
@@ -705,12 +709,10 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
     if sm_data:
         try:
             sm_hist = sm_data["hist_stats"]["ssm"]
-            # Shorter SMAP baseline note
-            sm_hist["baseline"] = f"{SMAP_HIST_START[:4]}–{SMAP_HIST_END[:4]} (SMAP)"
             sm = _summarize(
-                sm_data["cur_series"]["ssm"],  sm_data["chart_series"]["ssm"],
+                sm_data["cur_series"]["ssm"],  sm_data["recent_series"]["ssm"],
                 sm_hist,                        sm_data["monthly_clim"]["ssm"],
-                "sm", scale_label,
+                "sm",
             )
         except Exception as exc:
             logger.warning("SM summarize failed: %s", exc)
@@ -735,7 +737,7 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
             "calendar_months": list(cal),
             "region": socio["region"], "season": socio["season"],
             "hist_baseline": f"{HIST_START[:4]}–{HIST_END[:4]} (20 años MODIS)",
-            "chart_years": CHART_YEARS,
+            "recent_months": RECENT_MONTHS,
             "current_month": date.today().month,
             "current_month_name": MONTH_NAMES[date.today().month],
         },

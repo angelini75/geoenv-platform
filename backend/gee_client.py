@@ -103,23 +103,32 @@ def extract_series(collection: ee.ImageCollection, geometry: ee.Geometry,
 def extract_monthly_climatology(collection: ee.ImageCollection, geometry: ee.Geometry,
                                scale: int, bands: list[str]) -> dict[str, dict]:
     """
-    Compute mean and std for each calendar month (1–12) in a single getInfo() call.
-    Returns {band: {month_int: {"mean": float, "std": float}}}
+    Compute mean, std and percentiles (p10/p25/p50/p75/p90) for each calendar
+    month (1–12) in a single getInfo() call.
+    Returns {band: {month_int: {"mean", "std", "p10", "p25", "p50", "p75", "p90"}}}
 
     All 12 monthly reductions are combined into one multi-band image so only
     one network round-trip is needed regardless of the number of months or bands.
     """
+    combined_reducer = (
+        ee.Reducer.mean()
+        .combine(reducer2=ee.Reducer.stdDev(), sharedInputs=True)
+        .combine(reducer2=ee.Reducer.percentile([10, 25, 50, 75, 90]), sharedInputs=True)
+    )
+
     monthly_imgs = []
     for month in range(1, 13):
         m_col  = collection.filter(ee.Filter.calendarRange(month, month, "month"))
-        m_stat = m_col.reduce(
-            ee.Reducer.mean().combine(reducer2=ee.Reducer.stdDev(), sharedInputs=True)
-        )
+        m_stat = m_col.reduce(combined_reducer)
         old_names = []
         new_names = []
         for b in bands:
-            old_names += [f"{b}_mean", f"{b}_stdDev"]
-            new_names += [f"{b}_m{month:02d}_mu", f"{b}_m{month:02d}_sd"]
+            old_names += [f"{b}_mean", f"{b}_stdDev",
+                          f"{b}_p10", f"{b}_p25", f"{b}_p50", f"{b}_p75", f"{b}_p90"]
+            new_names += [f"{b}_m{month:02d}_mu", f"{b}_m{month:02d}_sd",
+                          f"{b}_m{month:02d}_p10", f"{b}_m{month:02d}_p25",
+                          f"{b}_m{month:02d}_p50", f"{b}_m{month:02d}_p75",
+                          f"{b}_m{month:02d}_p90"]
         monthly_imgs.append(m_stat.select(old_names, new_names))
 
     combined = ee.Image.cat(monthly_imgs)
@@ -128,15 +137,21 @@ def extract_monthly_climatology(collection: ee.ImageCollection, geometry: ee.Geo
         scale=scale, maxPixels=1e6
     ).getInfo()
 
+    def _r(v):
+        return round(v, 5) if v is not None else None
+
     result = {}
     for b in bands:
         result[b] = {}
         for month in range(1, 13):
-            mu = raw.get(f"{b}_m{month:02d}_mu")
-            sd = raw.get(f"{b}_m{month:02d}_sd")
             result[b][month] = {
-                "mean": round(mu, 5) if mu is not None else None,
-                "std":  round(sd, 5) if sd is not None else None,
+                "mean": _r(raw.get(f"{b}_m{month:02d}_mu")),
+                "std":  _r(raw.get(f"{b}_m{month:02d}_sd")),
+                "p10":  _r(raw.get(f"{b}_m{month:02d}_p10")),
+                "p25":  _r(raw.get(f"{b}_m{month:02d}_p25")),
+                "p50":  _r(raw.get(f"{b}_m{month:02d}_p50")),
+                "p75":  _r(raw.get(f"{b}_m{month:02d}_p75")),
+                "p90":  _r(raw.get(f"{b}_m{month:02d}_p90")),
             }
     return result
 

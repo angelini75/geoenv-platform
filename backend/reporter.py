@@ -141,32 +141,40 @@ INDEX_DEFS = {
 # Build the structured JSON payload for the LLM
 # ---------------------------------------------------------------------------
 
-def _compact_curve(seasonal_curve: dict | None) -> dict:
-    """Convert {month_int: mean_or_none} to {month_abbr: mean_or_null}."""
-    abbrev = {1:"Ene",2:"Feb",3:"Mar",4:"Abr",5:"May",6:"Jun",
-              7:"Jul",8:"Ago",9:"Sep",10:"Oct",11:"Nov",12:"Dic"}
-    if not seasonal_curve:
+_MONTH_ABBR = {1:"Ene",2:"Feb",3:"Mar",4:"Abr",5:"May",6:"Jun",
+               7:"Jul",8:"Ago",9:"Sep",10:"Oct",11:"Nov",12:"Dic"}
+
+
+def _compact_climatology(climatology: dict | None) -> dict:
+    """Convert {month_int: {mean, p10..p90}} → {month_abbr: {mean, p25, p50, p75}}."""
+    if not climatology:
         return {}
-    return {abbrev[int(m)]: round(v, 4) if v is not None else None
-            for m, v in seasonal_curve.items()}
+    out = {}
+    for m, v in climatology.items():
+        abbr = _MONTH_ABBR.get(int(m), str(m))
+        out[abbr] = {
+            "media": round(v["mean"], 4) if v.get("mean") is not None else None,
+            "p25":   round(v["p25"],  4) if v.get("p25")  is not None else None,
+            "p50":   round(v["p50"],  4) if v.get("p50")  is not None else None,
+            "p75":   round(v["p75"],  4) if v.get("p75")  is not None else None,
+        }
+    return out
 
 
-def _recent_candles(candles: list, n: int = 6) -> list:
-    """Return last N monthly candles in compact form."""
-    if not candles:
+def _recent_trend(recent_series: list, n: int = 6) -> list:
+    """Return last N monthly values in compact form: [{mes, valor}]."""
+    if not recent_series:
         return []
     return [
-        {"mes": c["period"][:7], "O": c["open"], "H": c["high"],
-         "L": c["low"], "C": c["close"], "z": c["z_close"],
-         "clase": c["anomaly_class"]}
-        for c in candles[-n:]
+        {"mes": pt["date"][:7], "valor": pt["value"]}
+        for pt in recent_series[-n:]
     ]
 
 
 def build_llm_payload(data: dict) -> dict:
     """
     Build a structured JSON payload that contains everything the LLM needs:
-    definitions, seasonal curves, current values, recent candles,
+    index definitions, seasonal climatology, current values, recent trend,
     precipitation and socioeconomic context.
     """
     meta    = data["meta"]
@@ -181,19 +189,25 @@ def build_llm_payload(data: dict) -> dict:
             continue
         if d is None:          # optional indicator not available
             continue
-        # R-014: "definicion" block removed from user prompt — it's now in SYSTEM_INSTRUCTION
-        # (static content → implicit caching; reduces per-call token usage).
+        # Current-month percentiles for context
+        clim    = d.get("climatology", {})
+        cur_m_clim = clim.get(cur_m, clim.get(str(cur_m), {})) if clim else {}
+
         indices_payload[key.upper()] = {
             "valor_actual":            d.get("current"),
-            "media_estacional_mes_actual": d.get("hist_mean"),   # current-month seasonal mean
+            "fecha_dato":              d.get("current_date"),
+            "media_estacional_mes":    d.get("hist_mean"),
             "desvio_estacional":       d.get("hist_std"),
-            "z_score_estacional":      d.get("z_score"),         # vs same calendar month
+            "p25_mes_actual":          cur_m_clim.get("p25"),
+            "p50_mes_actual":          cur_m_clim.get("p50"),
+            "p75_mes_actual":          cur_m_clim.get("p75"),
+            "z_score_estacional":      d.get("z_score"),
             "desviacion_pct":          d.get("pct_deviation"),
             "clase_anomalia":          d.get("anomaly_class"),
             "hist_min_20yr":           d.get("hist_min"),
             "hist_max_20yr":           d.get("hist_max"),
-            "curva_estacional_medias": _compact_curve(d.get("seasonal_curve")),
-            "velas_recientes_6m":      _recent_candles(d.get("candlesticks", [])),
+            "climatologia_estacional": _compact_climatology(clim),
+            "tendencia_reciente_6m":   _recent_trend(d.get("recent_series", [])),
             "n_observaciones_periodo": d.get("n_observations", 0),
         }
 
@@ -264,19 +278,22 @@ Tu tarea es redactar informes técnicos basados en índices satelitales MODIS y 
 
 {_index_defs_text()}
 METODOLOGÍA DE Z-SCORES (FUNDAMENTAL — leer antes de interpretar cualquier dato):
-- Los z-scores en este sistema son ESTACIONALES: cada índice se compara contra la media del MISMO
-  mes calendario a lo largo de 20 años (2004-2024), NO contra un promedio anual.
+- Los z-scores son ESTACIONALES: cada índice se compara contra la media del MISMO mes calendario
+  a lo largo de 20 años (2004-2024), NO contra un promedio anual.
   Esto corrige la estacionalidad natural (ej: NDVI alto en enero no es anomalía si enero siempre es alto).
-- La curva_estacional_medias muestra el patrón típico mensual de cada índice (12 valores).
+- La climatologia_estacional muestra la distribución histórica por mes: media, p25, p50 (mediana) y p75.
+- Los percentiles p25–p75 representan el rango "normal" para cada mes. Valores fuera de ese rango son inusuales.
 - LIMITACIÓN: el baseline es estático 2004-2024. Tendencias climáticas de largo plazo pueden
   sesgar los z-scores. Menciona esta limitación cuando sea relevante.
 
-UMBRALES DE CLASIFICACIÓN:
-- |z| < 1σ   → Normal
-- 1σ ≤ |z| < 1.5σ → Anomalía moderada
-- |z| ≥ 1.5σ → Anomalía extrema
-- VHI < 0.2  → Emergencia de sequía; 0.2–0.35 → Sequía severa
-- Las velas recientes muestran la tendencia de los últimos 6 meses (OHLC mensual).
+UMBRALES DE CLASIFICACIÓN (anomaly_class):
+- muy_bajo  : z < −1.5σ (extremadamente por debajo del promedio del mes)
+- bajo      : −1.5 ≤ z < −0.5σ
+- normal    : −0.5 ≤ z ≤ +0.5σ
+- alto      : +0.5 < z ≤ +1.5σ
+- muy_alto  : z > +1.5σ
+- VHI < 0.2 → Emergencia de sequía; 0.2–0.35 → Sequía severa
+- La tendencia_reciente_6m muestra los últimos 6 valores mensuales (media mensual real).
 
 Escribe en español técnico, con precisión cuantitativa. Usa Markdown (## y **negritas**).
 Objetivo: 600–900 palabras en 5 secciones ordenadas. No inventes datos ausentes del JSON."""
@@ -285,9 +302,8 @@ Objetivo: 600–900 palabras en 5 secciones ordenadas. No inventes datos ausente
 def build_prompt(payload: dict) -> str:
     payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
     return f"""A continuación encontrarás el JSON completo del análisis ambiental.
-Cada índice incluye su definición, interpretación de anomalías, valor actual,
-media estacional del mes en curso, z-score estacional, curva de estacionalidad
-(media de los últimos 20 años por mes calendario) y las últimas 6 velas mensuales.
+Cada índice incluye su valor actual, percentiles estacionales del mes en curso (p25/p50/p75),
+z-score estacional, climatología mensual histórica y tendencia de los últimos 6 meses.
 
 ## DATOS DEL ANÁLISIS (JSON)
 
@@ -305,10 +321,10 @@ Redacta el informe con estas 5 secciones en orden estricto:
 
 2. **Estado del ecosistema**: analiza cuantitativamente cada grupo de índices
    (vegetación: NDVI/EVI/SAVI, agua/sequía: NDWI/MNDWI/VCI/VHI, temperatura: LST/TCI, fuego: NBR).
-   Para cada uno menciona el valor actual vs la media estacional del mes, el z-score y su severidad.
-   Aprovecha la curva estacional para contextualizar si el valor es esperable para esta época del año.
+   Para cada uno menciona el valor actual vs el p50 estacional del mes, el z-score y su clase de anomalía.
+   Usa los percentiles p25/p75 para contextualizar si el valor está dentro del rango histórico normal.
 
-3. **Análisis de tendencia temporal**: interpreta las velas mensuales recientes (últimos 6 meses).
+3. **Tendencia reciente** (últimos 6 meses): interpreta la serie mensual real.
    ¿La situación mejora, empeora o es estable? ¿Hay cambio de tendencia reciente?
 
 4. **Impacto productivo-económico**: conecta los indicadores con la producción agropecuaria
