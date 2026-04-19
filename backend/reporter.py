@@ -261,7 +261,48 @@ def build_llm_payload(data: dict) -> dict:
             "cadena_causalidad":       socio["causality_chain"],
             "supuestos":               socio["assumptions"],
         },
-        "contexto_topografico": data.get("static_context"),  # {hand_m, elevation_m, slope_deg}
+        "contexto_topografico": _format_static_context(data.get("static_context")),
+    }
+
+
+def _format_static_context(ctx: dict | None) -> dict | None:
+    """Add human-readable interpretation labels to the static terrain context."""
+    if not ctx:
+        return None
+
+    def slope_label(deg):
+        if deg is None: return None
+        if deg < 1:  return "plano"
+        if deg < 5:  return "suave"
+        if deg < 15: return "moderado"
+        return "fuerte"
+
+    def twi_label(twi):
+        if twi is None: return None
+        if twi < 5:  return "bien drenado / convexo"
+        if twi < 8:  return "moderado"
+        return "convergente / susceptible a anegamiento"
+
+    def curv_label(c):
+        if c is None: return None
+        if c < -0.5: return "cóncavo (convergente)"
+        if c > 0.5:  return "convexo (divergente)"
+        return "plano"
+
+    return {
+        "altitud_m":          ctx.get("elevation_m"),
+        "pendiente_deg":      ctx.get("slope_deg"),
+        "pendiente_clase":    slope_label(ctx.get("slope_deg")),
+        "hand_m":             ctx.get("hand_m"),
+        "hand_interpretacion": (
+            "próximo a drenaje — riesgo de inundación" if (ctx.get("hand_m") or 999) < 5
+            else "alejado de drenajes — bajo riesgo hídrico fluvial"
+        ) if ctx.get("hand_m") is not None else None,
+        "twi":              ctx.get("twi"),
+        "twi_clase":        twi_label(ctx.get("twi")),
+        "curvatura":        ctx.get("curvature"),
+        "curvatura_clase":  curv_label(ctx.get("curvature")),
+        "fuente":           "MERIT/Hydro v1.0.1 + SRTM 30m, resolución 90m",
     }
 
 
@@ -294,6 +335,14 @@ METODOLOGÍA DE Z-SCORES (FUNDAMENTAL — leer antes de interpretar cualquier da
 - Los percentiles p25–p75 representan el rango "normal" para cada mes. Valores fuera de ese rango son inusuales.
 - LIMITACIÓN: el baseline es estático 2004-2024. Tendencias climáticas de largo plazo pueden
   sesgar los z-scores. Menciona esta limitación cuando sea relevante.
+
+INTERPRETACIÓN DEL CONTEXTO TOPOGRÁFICO:
+- altitud_m: elevación sobre el nivel del mar
+- pendiente_deg: pendiente en grados; >15° = fuerte, 5-15° = moderada, <5° = suave/plana
+- hand_m: Height Above Nearest Drainage; <5m = muy próximo a drenaje y susceptible a inundación
+- twi: Topographic Wetness Index = ln(área_acumulada / tan(pendiente)); alto (>10) = convergente/húmedo
+- curvatura: positiva = convexo (agua escurre), negativa = cóncavo (agua converge y acumula)
+- Estos factores condicionan la distribución de humedad, acumulación de agua y riesgo de anegamiento
 
 UMBRALES DE CLASIFICACIÓN (anomaly_class):
 - muy_bajo  : z < −1.5σ (extremadamente por debajo del promedio del mes)
