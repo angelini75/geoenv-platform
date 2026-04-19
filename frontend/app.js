@@ -383,17 +383,38 @@ function renderIndexSections(data) {
   if (state.marketData) renderMarket(state.marketData);
 }
 
-// ── Charts — ALL valid points overlaid ────────────────────────
+// ── Charts — seasonal band + recent trend ─────────────────────
 let _lwCharts = {};
 
 const CHART_GROUPS = [
   { containerId: "charts-veg",
-    defs: [{ key:"ndvi", label:"NDVI" }, { key:"evi", label:"EVI" }, { key:"savi", label:"SAVI" }] },
+    defs: [
+      { key:"ndvi", label:"NDVI", bandColor:"#23d18b" },
+      { key:"evi",  label:"EVI",  bandColor:"#23d18b" },
+      { key:"savi", label:"SAVI", bandColor:"#23d18b" },
+    ]},
   { containerId: "charts-water",
-    defs: [{ key:"ndwi", label:"NDWI" }, { key:"mndwi", label:"MNDWI" }, { key:"vci", label:"VCI" }] },
+    defs: [
+      { key:"ndwi",  label:"NDWI",  bandColor:"#3b9eff" },
+      { key:"mndwi", label:"MNDWI", bandColor:"#3b9eff" },
+      { key:"vci",   label:"VCI",   bandColor:"#3b9eff" },
+    ]},
   { containerId: "charts-thermal",
-    defs: [{ key:"lst", label:"LST (°C)" }, { key:"tci", label:"TCI" }, { key:"nbr", label:"NBR" }] },
+    defs: [
+      { key:"lst",       label:"LST día (°C)",  bandColor:"#e5b93c" },
+      { key:"lst_night", label:"LST noche (°C)", bandColor:"#e8a03a" },
+      { key:"tci",       label:"TCI",           bandColor:"#e5b93c" },
+      { key:"nbr",       label:"NBR",           bandColor:"#f07b3a" },
+    ]},
 ];
+
+// hex #rrggbb → rgba(r,g,b,alpha)
+function hexRgba(hex, alpha) {
+  const r = parseInt(hex.slice(1,3), 16);
+  const g = parseInt(hex.slice(3,5), 16);
+  const b = parseInt(hex.slice(5,7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
 
 function renderAllCharts() {
   const valid  = state.points.filter(p => p.result && !p.result._error);
@@ -406,9 +427,9 @@ function renderChartGroup(containerId, defs, validPoints, single) {
   const container = document.getElementById(containerId);
   if (!container) return;
 
-  // Keep only defs where ≥1 point has candle data
+  // Keep only defs where ≥1 point has recent_series data
   const active = defs.filter(d =>
-    validPoints.some(p => (p.result.indices[d.key]?.candlesticks?.length ?? 0) > 0)
+    validPoints.some(p => (p.result.indices[d.key]?.recent_series?.length ?? 0) > 0)
   );
   if (!active.length) { container.innerHTML = ""; return; }
 
@@ -425,12 +446,12 @@ function renderChartGroup(containerId, defs, validPoints, single) {
   container.innerHTML = active.map(d => `
     <div class="chart-card">
       <div class="chart-header">
-        <span>${d.label} — Velas mensuales${!single ? " · " + validPoints.length + " puntos" : ""}</span>
+        <span>${d.label} — tendencia + banda estacional${!single ? " · " + validPoints.length + " puntos" : ""}</span>
         <div class="chart-timerange" id="tr-${d.key}">
-          <button class="tr-btn" data-m="3">3M</button>
           <button class="tr-btn" data-m="6">6M</button>
           <button class="tr-btn active" data-m="12">1A</button>
-          <button class="tr-btn" data-m="36">MAX</button>
+          <button class="tr-btn" data-m="24">2A</button>
+          <button class="tr-btn" data-m="0">MAX</button>
         </div>
       </div>
       ${legendHtml}
@@ -439,29 +460,28 @@ function renderChartGroup(containerId, defs, validPoints, single) {
 
   requestAnimationFrame(() => {
     for (const d of active) {
-      const series = validPoints
+      // Build per-point data bundles
+      const pointData = validPoints
         .map(p => ({
-          candles: p.result.indices[d.key]?.candlesticks || [],
+          recent:  p.result.indices[d.key]?.recent_series || [],
+          clim:    p.result.indices[d.key]?.climatology   || {},
           color:   p.color,
           ptId:    p.id,
         }))
-        .filter(s => s.candles.length > 0);
-      plotMultiCandle(d.key, series, single);
+        .filter(pd => pd.recent.length > 0);
+      if (pointData.length) plotSeasonalChart(d.key, pointData, single, d.bandColor);
     }
   });
 }
 
-// hex #rrggbb → rgba(r,g,b,alpha)
-function hexRgba(hex, alpha) {
-  const r = parseInt(hex.slice(1,3), 16);
-  const g = parseInt(hex.slice(3,5), 16);
-  const b = parseInt(hex.slice(5,7), 16);
-  return `rgba(${r},${g},${b},${alpha})`;
-}
-
-function plotMultiCandle(key, pointSeries, single) {
+/**
+ * Plot a seasonal-band chart for one indicator.
+ * For single-point: draws p10/p25/p50/p75/p90 bands + actual line.
+ * For multi-point: draws bands from first/active point + one actual line per point.
+ */
+function plotSeasonalChart(key, pointData, single, bandColor) {
   const el = document.getElementById(`chart-${key}`);
-  if (!el || !pointSeries.length) return;
+  if (!el || !pointData.length) return;
   if (_lwCharts[key]) { try { _lwCharts[key].remove(); } catch (_) {} }
   el.innerHTML = "";
 
@@ -469,49 +489,80 @@ function plotMultiCandle(key, pointSeries, single) {
     layout:     { background: { type: "solid", color: "#0e1520" }, textColor: "#7a90aa", fontSize: 10 },
     grid:       { vertLines: { color: "#1c2d42", style: 1 }, horzLines: { color: "#1c2d42", style: 1 } },
     crosshair:  { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor: "#243650", scaleMargins: { top: 0.08, bottom: 0.08 } },
+    rightPriceScale: { borderColor: "#243650", scaleMargins: { top: 0.10, bottom: 0.10 } },
     timeScale:  { borderColor: "#243650", fixLeftEdge: true, fixRightEdge: true },
-    width:  el.clientWidth  || 400,
-    height: 230,
+    width:  el.clientWidth || 400,
+    height: 240,
   });
   _lwCharts[key] = chart;
   new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth })).observe(el);
 
-  for (const ps of pointSeries) {
-    // Single-point: classic green/red. Multi-point: each point's own color.
-    const upColor   = single ? "#23d18b"              : ps.color;
-    const downColor = single ? "#e8425a"              : hexRgba(ps.color, 0.40);
-    const wickUp    = single ? "#23d18b"              : ps.color;
-    const wickDown  = single ? "#e8425a"              : hexRgba(ps.color, 0.65);
+  // ── Seasonal bands (use the first/active point's climatology) ──
+  const refPoint = pointData[0];
+  const clim     = refPoint.clim;
 
-    const cs = chart.addCandlestickSeries({
-      upColor, downColor,
-      borderUpColor:   upColor,
-      borderDownColor: downColor,
-      wickUpColor:     wickUp,
-      wickDownColor:   wickDown,
-    });
-
-    cs.setData(ps.candles.map(c => ({
-      time: c.period,    // "YYYY-MM-DD" — Lightweight Charts accepts string dates
-      open: c.open, high: c.high, low: c.low, close: c.close,
-    })));
-
-    // Anomaly markers (z-score dots)
-    const markers = ps.candles
-      .filter(c => c.z_close !== null && Math.abs(c.z_close) >= 1.5)
-      .map(c => ({
-        time:     c.period,
-        position: c.z_close > 0 ? "aboveBar" : "belowBar",
-        color:    Math.abs(c.z_close) >= 2.5 ? "#e8425a" : "#e5b93c",
-        shape:    "circle", size: 0.8,
-        text:     `${c.z_close > 0 ? "+" : ""}${c.z_close.toFixed(1)}σ`,
-      }))
-      .sort((a, b) => a.time.localeCompare(b.time));
-    if (markers.length) cs.setMarkers(markers);
+  // Helper: build a series from recent dates using a climatology percentile
+  function bandSeries(recent, pctKey) {
+    return recent.map(pt => {
+      const month = new Date(pt.date).getMonth() + 1;
+      const val   = clim[month]?.[pctKey];
+      return val !== null && val !== undefined ? { time: pt.date, value: val } : null;
+    }).filter(Boolean);
   }
 
-  // Time-range control
+  const recent = refPoint.recent;
+
+  // p10 outer envelope (very faint line)
+  const s10 = chart.addLineSeries({ color: hexRgba(bandColor, 0.15), lineWidth: 1,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  s10.setData(bandSeries(recent, "p10"));
+
+  // p90 outer envelope (very faint line)
+  const s90 = chart.addLineSeries({ color: hexRgba(bandColor, 0.15), lineWidth: 1,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  s90.setData(bandSeries(recent, "p90"));
+
+  // p25 IQR line (faint)
+  const s25 = chart.addLineSeries({ color: hexRgba(bandColor, 0.35), lineWidth: 1,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  s25.setData(bandSeries(recent, "p25"));
+
+  // p75 IQR line (faint)
+  const s75 = chart.addLineSeries({ color: hexRgba(bandColor, 0.35), lineWidth: 1,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  s75.setData(bandSeries(recent, "p75"));
+
+  // p50 median (dashed, more visible)
+  const s50 = chart.addLineSeries({
+    color: hexRgba(bandColor, 0.65), lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+  });
+  s50.setData(bandSeries(recent, "p50"));
+
+  // ── Actual value series — one per point ───────────────────────
+  for (const pd of pointData) {
+    const lineColor = single ? bandColor : pd.color;
+    const actual = chart.addLineSeries({
+      color:     lineColor,
+      lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: true,
+      crosshairMarkerVisible: true,
+    });
+    actual.setData(pd.recent.map(pt => ({ time: pt.date, value: pt.value })));
+
+    // Mark current value with a circle at the last point
+    if (pd.recent.length > 0) {
+      const last = pd.recent[pd.recent.length - 1];
+      actual.setMarkers([{
+        time: last.date, position: "inBar", color: lineColor,
+        shape: "circle", size: 1.2,
+      }]);
+    }
+  }
+
+  // ── Time-range control ────────────────────────────────────────
   const applyRange = (months) => {
     if (months === 0) {
       chart.timeScale().fitContent();
@@ -522,26 +573,27 @@ function plotMultiCandle(key, pointSeries, single) {
     }
   };
 
-  // Default: 1-year view
   chart.timeScale().fitContent();
-  setTimeout(() => applyRange(12), 60);
+  setTimeout(() => applyRange(12), 60);   // default: 1-year view
 
-  // Wire up the time-range buttons for this chart
   document.querySelectorAll(`#tr-${key} .tr-btn`).forEach(btn => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(`#tr-${key} .tr-btn`).forEach(b => b.classList.remove("active"));
       btn.classList.add("active");
-      applyRange(parseInt(btn.dataset.m, 10));
+      const m = parseInt(btn.dataset.m, 10);
+      applyRange(m);
     });
   });
 }
 
 // ── Index card ────────────────────────────────────────────────
 const ANOMALY_MAP = {
-  "Normal":            { cls: "normal",   color: "#23d18b" },
-  "Anomalía moderada": { cls: "moderate", color: "#e5b93c" },
-  "Anomalía extrema":  { cls: "extreme",  color: "#e8425a" },
-  "Sin datos":         { cls: "nodata",   color: "#1c2d42" },
+  "muy_alto":  { cls: "extreme",  color: "#e8425a", label: "Muy alto"   },
+  "alto":      { cls: "moderate", color: "#e5b93c", label: "Alto"       },
+  "normal":    { cls: "normal",   color: "#23d18b", label: "Normal"     },
+  "bajo":      { cls: "moderate", color: "#e5b93c", label: "Bajo"       },
+  "muy_bajo":  { cls: "extreme",  color: "#e8425a", label: "Muy bajo"   },
+  "sin_datos": { cls: "nodata",   color: "#1c2d42", label: "Sin datos"  },
 };
 
 function idxCard(name, d, desc, unit = "") {
@@ -549,7 +601,12 @@ function idxCard(name, d, desc, unit = "") {
   const val = d.current;
   const z   = d.z_score;
   const pct = d.pct_deviation;
-  const ac  = ANOMALY_MAP[d.anomaly_class] || ANOMALY_MAP["Sin datos"];
+  const ac  = ANOMALY_MAP[d.anomaly_class] || ANOMALY_MAP["sin_datos"];
+
+  // Get current-month percentiles from climatology
+  const curMonth = new Date().getMonth() + 1;
+  const mClim    = d.climatology?.[curMonth] || {};
+  const p25 = mClim.p25, p50 = mClim.p50, p75 = mClim.p75;
 
   const zW         = z !== null ? Math.min(Math.abs(z) / 3 * 100, 100) : 0;
   const valDisplay = val !== null && val !== undefined
@@ -558,19 +615,20 @@ function idxCard(name, d, desc, unit = "") {
     ? `${z > 0 ? "+" : ""}${z.toFixed(2)}σ` : "N/D";
   const pctDisplay = pct !== null && pct !== undefined
     ? ` · ${pct > 0 ? "+" : ""}${pct.toFixed(1)}%` : "";
-  const meanDisplay = d.hist_mean !== null && d.hist_mean !== undefined
-    ? `μ ${d.hist_mean.toFixed(Math.abs(d.hist_mean) > 10 ? 1 : 3)}${unit}` : "μ N/D";
-  const stdDisplay  = d.hist_std !== null && d.hist_std !== undefined
-    ? ` · σ ${d.hist_std.toFixed(Math.abs(d.hist_std) > 10 ? 1 : 3)}` : "";
+
+  const p50Disp = p50 !== null && p50 !== undefined
+    ? `p50 ${p50.toFixed(Math.abs(p50) > 10 ? 1 : 3)}${unit}` : "p50 N/D";
+  const iqrDisp = (p25 !== null && p75 !== null)
+    ? ` [${p25.toFixed(Math.abs(p25) > 10 ? 1 : 2)}–${p75.toFixed(Math.abs(p75) > 10 ? 1 : 2)}]` : "";
 
   return `
   <div class="idx-card z-${ac.cls}" role="article" aria-label="${name}: ${valDisplay}">
     <div class="idx-name">${name}</div>
     <div class="idx-desc" title="${desc}">${desc}</div>
     <div class="idx-value" style="color:${val !== null ? ac.color : "var(--text-dim)"}">${valDisplay}</div>
-    <div class="idx-badge badge-${ac.cls}">${d.anomaly_class}</div>
+    <div class="idx-badge badge-${ac.cls}">${ac.label}</div>
     <div class="idx-stats">
-      ${meanDisplay}${stdDisplay}<br>
+      ${p50Disp}<span class="iqr-range">${iqrDisp}</span><br>
       <span class="z-val">${zDisplay}</span>${pctDisplay}
     </div>
     <div class="z-track" aria-hidden="true">
@@ -607,19 +665,66 @@ function renderPrecip(p) {
 }
 
 // ── Static context (topography) ───────────────────────────────
+function slopeLabel(deg) {
+  if (deg === null) return "";
+  if (deg < 1)   return "plano";
+  if (deg < 5)   return "suave";
+  if (deg < 15)  return "moderado";
+  return "fuerte";
+}
+function twiLabel(twi) {
+  if (twi === null) return "";
+  if (twi < 5)  return "bien drenado";
+  if (twi < 8)  return "moderado";
+  return "susceptible a anegamiento";
+}
+function curvLabel(c) {
+  if (c === null) return "";
+  if (c < -0.5) return "cóncavo";
+  if (c > 0.5)  return "convexo";
+  return "plano";
+}
+
 function renderStaticContext(ctx) {
   const bar = document.getElementById("static-ctx-bar");
-  const items = [
-    ctx.elevation_m !== null ? `🏔 <strong>${ctx.elevation_m} m</strong> elevación` : null,
-    ctx.hand_m      !== null ? `🌊 <strong>${ctx.hand_m} m</strong> HAND` : null,
-    ctx.slope_deg   !== null ? `📐 <strong>${ctx.slope_deg}°</strong> pendiente` : null,
+  if (!ctx) return;
+
+  const chips = [
+    ctx.elevation_m !== null
+      ? `<div class="terrain-chip"><div class="terrain-chip-icon">🏔</div>
+         <div class="terrain-chip-body"><div class="terrain-chip-val">${ctx.elevation_m} m</div>
+         <div class="terrain-chip-label">Altitud</div></div></div>` : null,
+
+    ctx.slope_deg !== null
+      ? `<div class="terrain-chip"><div class="terrain-chip-icon">📐</div>
+         <div class="terrain-chip-body"><div class="terrain-chip-val">${ctx.slope_deg}°</div>
+         <div class="terrain-chip-label">Pendiente · ${slopeLabel(ctx.slope_deg)}</div></div></div>` : null,
+
+    ctx.hand_m !== null
+      ? `<div class="terrain-chip"><div class="terrain-chip-icon">🌊</div>
+         <div class="terrain-chip-body"><div class="terrain-chip-val">${ctx.hand_m} m</div>
+         <div class="terrain-chip-label">HAND (drenaje)</div></div></div>` : null,
+
+    ctx.twi !== null && ctx.twi !== undefined
+      ? `<div class="terrain-chip"><div class="terrain-chip-icon">💧</div>
+         <div class="terrain-chip-body"><div class="terrain-chip-val">${ctx.twi}</div>
+         <div class="terrain-chip-label">TWI · ${twiLabel(ctx.twi)}</div></div></div>` : null,
+
+    ctx.curvature !== null && ctx.curvature !== undefined
+      ? `<div class="terrain-chip"><div class="terrain-chip-icon">↩</div>
+         <div class="terrain-chip-body"><div class="terrain-chip-val">${ctx.curvature > 0 ? "+" : ""}${ctx.curvature}</div>
+         <div class="terrain-chip-label">Curvatura · ${curvLabel(ctx.curvature)}</div></div></div>` : null,
   ].filter(Boolean);
-  if (!items.length) return;
+
+  if (!chips.length) return;
   bar.style.display = "flex";
   bar.innerHTML = `
-    <span class="ctx-label">Topografía estática</span>
-    ${items.map(i => `<span class="ctx-chip">${i}</span>`).join("")}
-    <span class="ctx-source">MERIT/SRTM · 90 m</span>`;
+    <div class="terrain-header">
+      <span class="idx-section-icon" aria-hidden="true">🗺</span>
+      <span class="idx-section-title" style="font-size:.82rem">Topografía estática</span>
+      <span class="idx-section-sub">MERIT/SRTM · 90 m</span>
+    </div>
+    <div class="terrain-chips">${chips.join("")}</div>`;
 }
 
 // ── Socioeconomic ─────────────────────────────────────────────
@@ -685,44 +790,104 @@ function renderMarket(data) {
 
   ts.textContent = data._timestamp ? `actualizado ${data._timestamp.slice(0, 10)}` : "";
 
-  const cards = [];
-
-  const usd = data.usd_oficial;
-  if (usd?.venta)
-    cards.push(marketCard("💵 Dólar oficial", `$${usd.venta.toLocaleString("es-AR")}`,
-      "venta BNA", usd.fecha, "var(--accent)"));
-
-  const vars = data.bcra_vars || {};
-  if (vars.badlar?.valor)
-    cards.push(marketCard("📈 Tasa BADLAR", `${vars.badlar.valor.toFixed(1)}%`,
-      "n.a. bancos privados", vars.badlar.fecha, "var(--yellow)"));
-
+  const fx     = data.fx     || {};
   const granos = data.granos || {};
-  for (const { key, icon, label } of [
-    { key: "soja_fas",  icon: "🌱", label: "Soja FAS"  },
-    { key: "maiz_fas",  icon: "🌽", label: "Maíz FAS"  },
-    { key: "trigo_fas", icon: "🌾", label: "Trigo FAS" },
-  ]) {
-    const v = granos[key];
-    if (v?.valor)
-      cards.push(marketCard(`${icon} ${label}`,
-        `$${v.valor.toLocaleString("es-AR")}`,
-        "$/tn teórico MAGyP", v.fecha, "var(--green)"));
+  const macro  = data.macro  || {};
+  const siem   = data.siembra || {};
+
+  let html = "";
+
+  // ── FX row ──
+  const fxItems = [
+    { key:"oficial", icon:"💵", label:"Oficial"  },
+    { key:"ccl",     icon:"💹", label:"CCL"      },
+    { key:"mep",     icon:"📊", label:"MEP"      },
+    { key:"blue",    icon:"💙", label:"Blue"     },
+  ].filter(f => fx[f.key]?.venta);
+
+  if (fxItems.length) {
+    const oficialVenta = fx.oficial?.venta;
+    html += `<div class="market-row-label">💱 Tipos de cambio</div>
+    <div class="market-ticker-row">` +
+      fxItems.map(f => {
+        const venta = fx[f.key].venta;
+        const spread = (oficialVenta && f.key !== "oficial")
+          ? ` <span class="spread-chip">${((venta/oficialVenta - 1)*100).toFixed(0)}%</span>` : "";
+        return `<div class="market-chip">
+          <div class="market-chip-title">${f.icon} ${f.label}</div>
+          <div class="market-chip-val">$${venta.toLocaleString("es-AR")}</div>
+          <div class="market-chip-sub">venta${spread}</div>
+        </div>`;
+      }).join("") + `</div>`;
   }
 
-  if (!cards.length) { section.style.display = "none"; return; }
-  grid.innerHTML = cards.join("");
-  section.style.display = "";
-}
+  // ── Granos FAS row ──
+  const granosItems = [
+    { key:"soja_fas",    icon:"🌱", label:"Soja"    },
+    { key:"maiz_fas",    icon:"🌽", label:"Maíz"    },
+    { key:"trigo_fas",   icon:"🌾", label:"Trigo"   },
+    { key:"girasol_fas", icon:"🌻", label:"Girasol" },
+  ].filter(g => granos[g.key]?.valor);
 
-function marketCard(title, value, subtitle, fecha, color) {
-  return `
-    <div class="market-card">
-      <div class="market-card-title">${title}</div>
-      <div class="market-card-val" style="color:${color}">${value}</div>
-      <div class="market-card-sub">${subtitle}</div>
-      ${fecha ? `<div class="market-card-date">${fecha}</div>` : ""}
-    </div>`;
+  if (granosItems.length) {
+    html += `<div class="market-row-label">🌾 Precios FAS (MAGyP)</div>
+    <div class="market-ticker-row">` +
+      granosItems.map(g => {
+        const v = granos[g.key];
+        return `<div class="market-chip">
+          <div class="market-chip-title">${g.icon} ${g.label}</div>
+          <div class="market-chip-val" style="color:var(--green)">$${Math.round(v.valor).toLocaleString("es-AR")}</div>
+          <div class="market-chip-sub">$/tn · ${v.fecha?.slice(0,7) || ""}</div>
+        </div>`;
+      }).join("") + `</div>`;
+  }
+
+  // ── Macro row ──
+  const macroChips = [];
+  if (macro.badlar?.valor) macroChips.push(
+    `<div class="market-chip"><div class="market-chip-title">📈 BADLAR</div>
+     <div class="market-chip-val" style="color:var(--yellow)">${macro.badlar.valor.toFixed(1)}%</div>
+     <div class="market-chip-sub">n.a. bancos priv.</div></div>`
+  );
+  if (macro.ipc_ng?.valor) macroChips.push(
+    `<div class="market-chip"><div class="market-chip-title">🧾 IPC m/m</div>
+     <div class="market-chip-val" style="color:var(--yellow)">${macro.ipc_ng.valor.toFixed(1)}%</div>
+     <div class="market-chip-sub">nivel gral INDEC · ${macro.ipc_ng.fecha?.slice(0,7) || ""}</div></div>`
+  );
+  if (macro.cer?.valor) macroChips.push(
+    `<div class="market-chip"><div class="market-chip-title">📉 CER</div>
+     <div class="market-chip-val">${macro.cer.valor.toLocaleString("es-AR")}</div>
+     <div class="market-chip-sub">índice BCRA · ${macro.cer.fecha?.slice(0,7) || ""}</div></div>`
+  );
+  if (macroChips.length) {
+    html += `<div class="market-row-label">📊 Macro</div>
+    <div class="market-ticker-row">${macroChips.join("")}</div>`;
+  }
+
+  // ── Avance siembra ──
+  const siembraItems = [
+    { key:"soja_siembra_pct",    icon:"🌱", label:"Soja"    },
+    { key:"maiz_siembra_pct",    icon:"🌽", label:"Maíz"    },
+    { key:"trigo_siembra_pct",   icon:"🌾", label:"Trigo"   },
+    { key:"girasol_siembra_pct", icon:"🌻", label:"Girasol" },
+  ].filter(s => siem[s.key]?.valor !== undefined && siem[s.key]?.valor !== null);
+
+  if (siembraItems.length) {
+    html += `<div class="market-row-label">🌱 Avance de siembra</div>
+    <div class="campaign-grid">` +
+      siembraItems.map(s => {
+        const pct = Math.min(100, Math.round(siem[s.key].valor));
+        return `<div class="campaign-row">
+          <span class="campaign-label">${s.icon} ${s.label}</span>
+          <progress class="campaign-bar" value="${pct}" max="100"></progress>
+          <span class="campaign-pct">${pct}%</span>
+        </div>`;
+      }).join("") + `</div>`;
+  }
+
+  if (!html) { section.style.display = "none"; return; }
+  grid.innerHTML = html;
+  section.style.display = "";
 }
 
 // ── AI Report ─────────────────────────────────────────────────
