@@ -4,6 +4,7 @@ All multi-band operations use a single getInfo() call per collection.
 """
 import ee
 import json
+import math
 import os
 import logging
 
@@ -179,27 +180,49 @@ def scale_smap(img: ee.Image) -> ee.Image:
 
 def extract_static_context(lat: float, lon: float) -> dict:
     """
-    Extract time-invariant topographic values at a point:
-      - HAND   : Height Above Nearest Drainage (MERIT Hydro, 90 m)
-      - elevation: SRTM 30 m elevation (m)
-      - slope  : terrain slope in degrees (from SRTM)
-    Returns {hand_m, elevation_m, slope_deg} — any value may be None on error.
+    Extract time-invariant topographic values at a point using a single getInfo() call.
+
+    Bands extracted:
+      - HAND        : Height Above Nearest Drainage (MERIT/Hydro/v1_0_1, 90 m)
+      - elevation   : SRTM 30 m elevation (m)
+      - slope       : terrain slope in degrees (from SRTM)
+      - TWI         : Topographic Wetness Index = ln(UPA_m² / tan(slope_rad))
+                      UPA from MERIT/Hydro/v1_0_1 band 'upa' (km² → converted to m²)
+      - curvature   : Surface curvature proxy (Laplacian of elevation × 1e6)
+                      Negative = concave/convergent; Positive = convex/divergent
+
+    Returns {hand_m, elevation_m, slope_deg, twi, curvature} — any value may be None.
     """
-    geom = ee.Geometry.Point([lon, lat])
+    geom    = ee.Geometry.Point([lon, lat]).buffer(300)   # ~300 m buffer
+    merit   = ee.Image("MERIT/Hydro/v1_0_1")
+    dem_img = ee.Image("USGS/SRTMGL1_003")
 
-    hand_img = ee.Image("MERIT/Hydro/v1_0_1").select("hnd")
-    dem_img  = ee.Image("USGS/SRTMGL1_003")
-    slp_img  = ee.Terrain.slope(dem_img)
+    hand_img  = merit.select("hnd").rename("hand")
+    elev_img  = dem_img.rename("elev")
+    slope_img = ee.Terrain.slope(dem_img).rename("slope")   # degrees
 
-    combined = hand_img.rename("hand").addBands(
-        dem_img.rename("elev")
-    ).addBands(
-        slp_img.rename("slope")
-    )
+    # TWI = ln(UPA_m² / tan(slope_rad))
+    # merit 'upa' = upstream area in km² → multiply by 1e6 to get m²
+    upa_m2    = merit.select("upa").multiply(1e6).rename("upa_m2")
+    slope_rad = slope_img.multiply(math.pi / 180.0)
+    # tan(slope_rad) — clamp to a minimum of 0.001 rad to avoid division by zero on flat terrain
+    tan_slope = slope_rad.tan().max(0.001)
+    twi_img   = upa_m2.divide(tan_slope).log().rename("twi")
+
+    # Curvature: Laplacian (second derivative) of elevation
+    # Use a 3×3 kernel: kernel weights for Laplacian = [0,1,0,1,-4,1,0,1,0]
+    lap_kernel = ee.Kernel.laplacian8(normalize=False)
+    curvature_img = dem_img.convolve(lap_kernel).multiply(1e4).rename("curvature")
+
+    combined = (hand_img
+                .addBands(elev_img)
+                .addBands(slope_img)
+                .addBands(twi_img)
+                .addBands(curvature_img))
 
     raw = combined.reduceRegion(
         reducer=ee.Reducer.mean(),
-        geometry=geom.buffer(500),
+        geometry=geom,
         scale=90,
         maxPixels=1e6,
     ).getInfo()
@@ -208,9 +231,11 @@ def extract_static_context(lat: float, lon: float) -> dict:
         return round(v, decimals) if v is not None else None
 
     return {
-        "hand_m":       _r(raw.get("hand"), 1),
-        "elevation_m":  _r(raw.get("elev"), 0),
-        "slope_deg":    _r(raw.get("slope"), 2),
+        "hand_m":      _r(raw.get("hand"),       1),
+        "elevation_m": _r(raw.get("elev"),        0),
+        "slope_deg":   _r(raw.get("slope"),       2),
+        "twi":         _r(raw.get("twi"),         2),
+        "curvature":   _r(raw.get("curvature"),   4),
     }
 
 
