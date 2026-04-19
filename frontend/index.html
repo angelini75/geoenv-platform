@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>GeoEnv — Indicadores Ambientales Argentina</title>
 
-  <!-- Performance: preconnect to external resources -->
   <link rel="preconnect" href="https://server.arcgisonline.com">
   <link rel="preconnect" href="https://basemaps.cartocdn.com">
   <link rel="preconnect" href="https://unpkg.com">
@@ -36,25 +35,26 @@
 <!-- ═══ WORKSPACE (map + controls) ═══ -->
 <div class="workspace" role="main">
 
-  <!--
-    height:100% inline → Leaflet requires an explicit height on its container.
-    CSS flex:1 handles width; this handles height within the flex parent.
-  -->
   <div id="map" style="height:100%"
        role="application"
-       aria-label="Mapa interactivo de Argentina — haga clic para seleccionar un punto de análisis"></div>
+       aria-label="Mapa interactivo de Argentina — haga clic para agregar puntos de análisis"></div>
 
   <!-- Control panel -->
   <aside class="ctrl-panel" aria-label="Panel de control">
     <div class="ctrl-inner">
 
+      <!-- Points list -->
       <div>
-        <div class="field-label" id="coords-label">Punto seleccionado</div>
-        <div class="coords-display" id="coords-display" role="status" aria-labelledby="coords-label">
-          Haga clic en el mapa para seleccionar un punto
+        <div class="field-label" id="points-label">
+          Puntos de análisis <span class="points-count" id="points-count"></span>
+        </div>
+        <div class="points-list" id="points-list" role="list"
+             aria-labelledby="points-label">
+          <div class="points-hint">Haga clic en el mapa · hasta 5 puntos</div>
         </div>
       </div>
 
+      <!-- Scale selector -->
       <div>
         <div class="field-label" id="scale-label">Ventana temporal</div>
         <div class="scale-row" role="group" aria-labelledby="scale-label">
@@ -69,19 +69,22 @@
       </div>
 
       <button class="btn-analyze" id="btn-analyze" disabled
-              aria-label="Iniciar análisis ambiental del punto seleccionado">
-        Analizar punto
+              aria-label="Iniciar análisis ambiental">
+        Seleccione un punto
       </button>
 
     </div>
   </aside>
 </div>
 
-<!-- ═══ DASHBOARD (scrollable, hidden until analysis runs) ═══ -->
-<!-- style="display:none" is an inline fallback in case CSS hasn't applied yet -->
+<!-- ═══ DASHBOARD ═══ -->
 <section id="dashboard" style="display:none"
          aria-live="polite"
          aria-label="Resultados del análisis ambiental">
+
+  <!-- Point tabs (visible when ≥ 2 points) -->
+  <div class="point-tabs-bar" id="point-tabs-bar" style="display:none"
+       role="tablist" aria-label="Seleccionar punto de análisis"></div>
 
   <!-- Situation banner -->
   <div class="sit-banner" id="sit-banner"></div>
@@ -91,7 +94,7 @@
     <div class="idx-section-header">
       <span class="idx-section-icon" aria-hidden="true">🌱</span>
       <span class="idx-section-title">Vegetación</span>
-      <span class="idx-section-sub">NDVI · EVI · SAVI — MODIS MOD13Q1 / MOD09A1 · 250–500 m</span>
+      <span class="idx-section-sub">NDVI · EVI · SAVI — MOD13Q1 / MOD09A1 · 250–500 m</span>
     </div>
     <div class="idx-grid" id="grid-veg"></div>
   </div>
@@ -102,7 +105,7 @@
     <div class="idx-section-header">
       <span class="idx-section-icon" aria-hidden="true">💧</span>
       <span class="idx-section-title">Agua &amp; Sequía</span>
-      <span class="idx-section-sub">NDWI · MNDWI · VCI · VHI — MODIS MOD09A1 / MOD13Q1</span>
+      <span class="idx-section-sub">NDWI · MNDWI · VCI · VHI — MOD09A1 / MOD13Q1</span>
     </div>
     <div class="idx-grid" id="grid-water"></div>
   </div>
@@ -113,11 +116,21 @@
     <div class="idx-section-header">
       <span class="idx-section-icon" aria-hidden="true">🌡️</span>
       <span class="idx-section-title">Temperatura &amp; Fuego</span>
-      <span class="idx-section-sub">LST · TCI · NBR — MODIS MOD11A2 / MOD09A1 · 500–1000 m</span>
+      <span class="idx-section-sub">LST · TCI · NBR — MOD11A2 / MOD09A1 · 500–1000 m</span>
     </div>
     <div class="idx-grid" id="grid-thermal"></div>
   </div>
   <div class="chart-section" id="charts-thermal"></div>
+
+  <!-- ET & Soil Moisture (optional — hidden if not available) -->
+  <div class="idx-section" id="section-hydro" style="display:none">
+    <div class="idx-section-header">
+      <span class="idx-section-icon" aria-hidden="true">🌊</span>
+      <span class="idx-section-title">Hidrología &amp; Suelo</span>
+      <span class="idx-section-sub">ET — MOD16A2GF · 500 m · Humedad suelo — SMAP · 10 km</span>
+    </div>
+    <div class="idx-grid" id="grid-hydro"></div>
+  </div>
 
   <!-- Precipitation -->
   <div class="idx-section">
@@ -129,10 +142,24 @@
     <div id="precip-card"></div>
   </div>
 
+  <!-- Static context (topography) -->
+  <div class="static-ctx-bar" id="static-ctx-bar" style="display:none"
+       aria-label="Contexto topográfico estático"></div>
+
   <div class="section-sep"></div>
 
   <!-- Socioeconomic context -->
   <div class="socio-section" id="socio-section"></div>
+
+  <!-- Market / economic context (loaded async) -->
+  <div class="market-section" id="market-section" style="display:none">
+    <div class="idx-section-header" style="padding:20px 24px 0; margin-bottom:14px">
+      <span class="idx-section-icon" aria-hidden="true">📊</span>
+      <span class="idx-section-title">Contexto de mercado</span>
+      <span class="idx-section-sub" id="market-ts"></span>
+    </div>
+    <div class="market-grid" id="market-grid"></div>
+  </div>
 
   <!-- AI Report -->
   <div class="report-section">
@@ -141,7 +168,7 @@
         <div class="report-title">
           <span aria-hidden="true">📄</span> Informe IA
         </div>
-        <div class="report-sub">Claude genera un análisis narrativo de 1–2 páginas</div>
+        <div class="report-sub">Gemini genera un análisis narrativo de 1–2 páginas</div>
       </div>
       <button class="btn-report" id="btn-report" disabled
               aria-label="Generar informe narrativo con inteligencia artificial">

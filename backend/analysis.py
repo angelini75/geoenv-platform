@@ -31,6 +31,7 @@ from cachetools import TTLCache
 from gee_client import (
     point_buffer,
     scale_mod13q1, scale_mod09a1, scale_mod11a2,
+    scale_mod16a2, scale_smap, extract_static_context,
     extract_series, extract_stats, extract_monthly_climatology,
 )
 
@@ -40,10 +41,13 @@ SCALE_DAYS = {
     "1w": 7, "2w": 14, "1m": 30, "2m": 60,
     "3m": 90, "6m": 180, "1y": 365,
 }
-HIST_START  = "2004-01-01"   # 20-year MODIS baseline
-HIST_END    = "2024-12-31"
-CHART_YEARS = 3              # monthly candle chart spans last N years
-GEE_TIMEOUT = 45             # seconds to wait for each GEE future (R-007)
+HIST_START      = "2004-01-01"   # 20-year MODIS baseline
+HIST_END        = "2024-12-31"
+SMAP_HIST_START = "2016-01-01"  # SMAP operational since April 2015
+SMAP_HIST_END   = "2024-12-31"
+CHART_YEARS     = 3              # monthly candle chart spans last N years
+GEE_TIMEOUT     = 45             # seconds — main 4 fetches
+GEE_OPT_TIMEOUT = 30             # seconds — optional indicators (ET, SM, static)
 
 # ── TTL cache for run_analysis (R-006) ─────────────────────────────
 # Key: (round(lat,3), round(lon,3), scale_label) → ~110m spatial tolerance
@@ -399,6 +403,42 @@ def _fetch_precip(lat, lon, start, end, cal):
 
 
 # ---------------------------------------------------------------------------
+# Optional GEE fetch functions (ET, Soil Moisture, static context)
+# ---------------------------------------------------------------------------
+
+def _fetch_et(lat, lon, start, end, cal):
+    """Evapotranspiración real — MODIS MOD16A2GF, 500 m, 8-day."""
+    geom  = point_buffer(lat, lon, 1000)
+    col   = ee.ImageCollection("MODIS/061/MOD16A2GF").map(scale_mod16a2)
+    hist  = col.filterDate(HIST_START, HIST_END)
+    cs, ce = _chart_range()
+    return {
+        "cur_series":   extract_series(col.filterDate(start, end), geom, 500, ["ET"]),
+        "hist_stats":   extract_stats(
+            hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
+            geom, 500, ["ET"]),
+        "chart_series": extract_series(col.filterDate(cs, ce), geom, 500, ["ET"]),
+        "monthly_clim": extract_monthly_climatology(hist, geom, 500, ["ET"]),
+    }
+
+
+def _fetch_soil_moisture(lat, lon, start, end, cal):
+    """Humedad superficial del suelo — NASA SMAP 10 km, diario."""
+    geom  = point_buffer(lat, lon, 10000)
+    col   = ee.ImageCollection("NASA_USDA/HSL/SMAP10KM_soil_moisture").map(scale_smap)
+    hist  = col.filterDate(SMAP_HIST_START, SMAP_HIST_END)
+    cs, ce = _chart_range()
+    return {
+        "cur_series":   extract_series(col.filterDate(start, end), geom, 10000, ["ssm"]),
+        "hist_stats":   extract_stats(
+            hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
+            geom, 10000, ["ssm"]),
+        "chart_series": extract_series(col.filterDate(cs, ce), geom, 10000, ["ssm"]),
+        "monthly_clim": extract_monthly_climatology(hist, geom, 10000, ["ssm"]),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Region / season / situation helpers
 # ---------------------------------------------------------------------------
 
@@ -567,11 +607,17 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
 
     logger.info("Analysis: (%.4f, %.4f) scale=%s %s→%s", lat, lon, scale_label, start, end)
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        f_veg    = pool.submit(_fetch_vegetation, lat, lon, start, end, cal)
-        f_opt    = pool.submit(_fetch_optical,    lat, lon, start, end, cal)
-        f_lst    = pool.submit(_fetch_lst,        lat, lon, start, end, cal)
-        f_precip = pool.submit(_fetch_precip,     lat, lon, start, end, cal)
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        # Core indicators (mandatory)
+        f_veg    = pool.submit(_fetch_vegetation,   lat, lon, start, end, cal)
+        f_opt    = pool.submit(_fetch_optical,      lat, lon, start, end, cal)
+        f_lst    = pool.submit(_fetch_lst,          lat, lon, start, end, cal)
+        f_precip = pool.submit(_fetch_precip,       lat, lon, start, end, cal)
+        # Optional indicators (run in parallel; failures → null, not 504)
+        f_et     = pool.submit(_fetch_et,           lat, lon, start, end, cal)
+        f_sm     = pool.submit(_fetch_soil_moisture, lat, lon, start, end, cal)
+        f_static = pool.submit(extract_static_context, lat, lon)
+
         # R-007: bound the wait so a hung GEE call never freezes the uvicorn worker.
         try:
             veg_data    = f_veg.result(timeout=GEE_TIMEOUT)
@@ -579,12 +625,24 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
             lst_data    = f_lst.result(timeout=GEE_TIMEOUT)
             precip_data = f_precip.result(timeout=GEE_TIMEOUT)
         except FutureTimeoutError:
-            for f in [f_veg, f_opt, f_lst, f_precip]:
+            for f in [f_veg, f_opt, f_lst, f_precip, f_et, f_sm, f_static]:
                 f.cancel()
             raise TimeoutError(
                 f"Earth Engine no respondió en {GEE_TIMEOUT}s. "
                 "El servicio puede estar saturado; reintente en un momento."
             )
+
+        # Optional — collect with shorter timeout; log but don't fail
+        def _safe_result(future, name):
+            try:
+                return future.result(timeout=GEE_OPT_TIMEOUT)
+            except Exception as exc:
+                logger.warning("Optional fetch '%s' failed: %s", name, exc)
+                return None
+
+        et_data     = _safe_result(f_et,     "et")
+        sm_data     = _safe_result(f_sm,     "soil_moisture")
+        static_data = _safe_result(f_static, "static_context")
 
     # --- Measured indices ---
     ndvi_hist  = veg_data["hist_stats"]["NDVI"]
@@ -630,11 +688,41 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
     tci = _summarize([], tci_chart, tci_alltime, tci_clim, "tci", scale_label, current_override=tci_val)
     vhi = _summarize([], vhi_chart, vhi_alltime, vhi_clim, "vhi", scale_label, current_override=vhi_val)
 
+    # --- Optional: ET (Evapotranspiración) ---
+    et = None
+    if et_data:
+        try:
+            et = _summarize(
+                et_data["cur_series"]["ET"],  et_data["chart_series"]["ET"],
+                et_data["hist_stats"]["ET"],  et_data["monthly_clim"]["ET"],
+                "et", scale_label,
+            )
+        except Exception as exc:
+            logger.warning("ET summarize failed: %s", exc)
+
+    # --- Optional: Soil Moisture (SMAP) ---
+    sm = None
+    if sm_data:
+        try:
+            sm_hist = sm_data["hist_stats"]["ssm"]
+            # Shorter SMAP baseline note
+            sm_hist["baseline"] = f"{SMAP_HIST_START[:4]}–{SMAP_HIST_END[:4]} (SMAP)"
+            sm = _summarize(
+                sm_data["cur_series"]["ssm"],  sm_data["chart_series"]["ssm"],
+                sm_hist,                        sm_data["monthly_clim"]["ssm"],
+                "sm", scale_label,
+            )
+        except Exception as exc:
+            logger.warning("SM summarize failed: %s", exc)
+
     indices = {
         "ndvi": ndvi, "evi": evi, "savi": savi,
         "ndwi": ndwi, "mndwi": mndwi, "vci": vci, "vhi": vhi,
         "lst": lst, "tci": tci, "nbr": nbr,
         "precipitation": precip_data,
+        # Optional — may be None if GEE fetch failed
+        "et":  et,
+        "sm":  sm,
     }
 
     indicator = _situation(indices)
@@ -654,6 +742,7 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
         "indices":             indices,
         "situation_indicator": indicator,
         "socioeconomic":       socio,
+        "static_context":      static_data,   # {hand_m, elevation_m, slope_deg} or None
     }
 
     # R-006: store in cache (elapsed_seconds is added by main.py after this call)

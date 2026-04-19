@@ -114,6 +114,26 @@ INDEX_DEFS = {
         "anomalia_positiva": "Vegetación íntegra, mayor biomasa.",
         "anomalia_negativa": "Posible quema reciente, degradación o pérdida de biomasa.",
     },
+    "ET": {
+        "nombre": "Evapotranspiración Real",
+        "formula": "Balance energético MODIS (algoritmo Mu et al. 2011)",
+        "rango_tipico": "0–10 mm/8-día; varía fuertemente por bioma y estación",
+        "fuente": "MODIS MOD16A2GF, 500 m, composición 8 días (gap-filled)",
+        "estacionalidad": "Máxima en verano (alta radiación + vegetación activa). "
+                          "El z-score compara contra el mismo mes histórico 2004–2024.",
+        "anomalia_positiva": "Alta demanda evaporativa o buena disponibilidad hídrica; riesgo de agotamiento de reservas en sequía.",
+        "anomalia_negativa": "Estrés hídrico (la planta cierra estomas), baja radiación o vegetación escasa.",
+    },
+    "SM": {
+        "nombre": "Humedad Superficial del Suelo",
+        "formula": "Retrodispersión SAR L-band (NASA SMAP) → mm de agua en los primeros 5 cm",
+        "rango_tipico": "0–60 mm; depende de textura y uso del suelo",
+        "fuente": "NASA SMAP 10 km (HSL enhanced), baseline 2016–2024",
+        "estacionalidad": "Sigue a las precipitaciones con rezago de 1–3 días. "
+                          "Baseline más corto (9 años) que los índices MODIS.",
+        "anomalia_positiva": "Suelo saturado o con exceso hídrico; riesgo de anegamiento o enfermedades fúngicas.",
+        "anomalia_negativa": "Suelo seco; déficit hídrico superficial, riesgo de estrés en cultivos de raíz superficial.",
+    },
 }
 
 
@@ -158,6 +178,8 @@ def build_llm_payload(data: dict) -> dict:
     indices_payload = {}
     for key, d in idx.items():
         if key == "precipitation":
+            continue
+        if d is None:          # optional indicator not available
             continue
         # R-014: "definicion" block removed from user prompt — it's now in SYSTEM_INSTRUCTION
         # (static content → implicit caching; reduces per-call token usage).
@@ -216,6 +238,7 @@ def build_llm_payload(data: dict) -> dict:
             "cadena_causalidad":       socio["causality_chain"],
             "supuestos":               socio["assumptions"],
         },
+        "contexto_topografico": data.get("static_context"),  # {hand_m, elevation_m, slope_deg}
     }
 
 

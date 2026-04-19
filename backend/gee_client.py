@@ -141,6 +141,62 @@ def extract_monthly_climatology(collection: ee.ImageCollection, geometry: ee.Geo
     return result
 
 
+def scale_mod16a2(img: ee.Image) -> ee.Image:
+    """MOD16A2GF: ET × 0.1 → kg/m²/8day (≈ mm per 8-day period). Fill -28672 → mask."""
+    return (
+        img.select("ET")
+        .updateMask(img.select("ET").gt(-28000))   # mask fill value
+        .multiply(0.1)
+        .copyProperties(img, ["system:time_start"])
+    )
+
+
+def scale_smap(img: ee.Image) -> ee.Image:
+    """SMAP 10KM: surface soil moisture (ssm) already in mm — just select + mask."""
+    return (
+        img.select("ssm")
+        .updateMask(img.select("ssm").gt(0))
+        .copyProperties(img, ["system:time_start"])
+    )
+
+
+def extract_static_context(lat: float, lon: float) -> dict:
+    """
+    Extract time-invariant topographic values at a point:
+      - HAND   : Height Above Nearest Drainage (MERIT Hydro, 90 m)
+      - elevation: SRTM 30 m elevation (m)
+      - slope  : terrain slope in degrees (from SRTM)
+    Returns {hand_m, elevation_m, slope_deg} — any value may be None on error.
+    """
+    geom = ee.Geometry.Point([lon, lat])
+
+    hand_img = ee.Image("MERIT/Hydro/v1_0_1").select("hnd")
+    dem_img  = ee.Image("USGS/SRTMGL1_003")
+    slp_img  = ee.Terrain.slope(dem_img)
+
+    combined = hand_img.rename("hand").addBands(
+        dem_img.rename("elev")
+    ).addBands(
+        slp_img.rename("slope")
+    )
+
+    raw = combined.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=geom.buffer(500),
+        scale=90,
+        maxPixels=1e6,
+    ).getInfo()
+
+    def _r(v, decimals=1):
+        return round(v, decimals) if v is not None else None
+
+    return {
+        "hand_m":       _r(raw.get("hand"), 1),
+        "elevation_m":  _r(raw.get("elev"), 0),
+        "slope_deg":    _r(raw.get("slope"), 2),
+    }
+
+
 def extract_stats(collection: ee.ImageCollection, geometry: ee.Geometry,
                   scale: int, bands: list[str]) -> dict[str, dict]:
     """

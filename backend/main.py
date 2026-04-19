@@ -24,6 +24,7 @@ from slowapi.errors import RateLimitExceeded
 import gee_client
 import analysis
 import reporter
+from services.market_apis import get_market_data
 
 logging.basicConfig(
     level=logging.INFO,
@@ -140,6 +141,16 @@ async def report(request: Request, data: dict):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/market")
+def market(request: Request):
+    """
+    Return Argentine market data (exchange rates, grain FAS prices, IPC).
+    Cached 4 h. Never raises — failed sources return null fields.
+    """
+    data = get_market_data()
+    return data
 
 
 app.mount("/static", StaticFiles(directory="/app/static"), name="static")
