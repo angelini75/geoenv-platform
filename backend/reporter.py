@@ -105,6 +105,15 @@ INDEX_DEFS = {
         "anomalia_positiva": "Temperatura más alta de lo normal para el mes (estrés calórico, sequía).",
         "anomalia_negativa": "Temperatura más baja de lo normal para el mes (riesgo de heladas, nieve tardía).",
     },
+    "LST_NIGHT": {
+        "nombre": "Temperatura de Superficie Terrestre Nocturna",
+        "formula": "Radiancia infrarroja térmica nocturna → Kelvin → °C",
+        "rango_tipico": "Variable; generalmente 3–8°C menor que la LST diurna",
+        "fuente": "MODIS MOD11A2, banda LST_Night_1km, 1 km, composición 8 días",
+        "estacionalidad": "Alta componente estacional. La amplitud térmica diurna-nocturna es indicadora de cobertura vegetal y humedad.",
+        "anomalia_positiva": "Noches más cálidas de lo normal (estrés calórico nocturno, menor disipación de calor).",
+        "anomalia_negativa": "Noches más frías de lo normal; riesgo de heladas en cultivos.",
+    },
     "NBR": {
         "nombre": "Ratio de Quema Normalizado",
         "formula": "(NIR − SWIR2) / (NIR + SWIR2)",

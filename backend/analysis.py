@@ -355,12 +355,13 @@ def _fetch_lst(lat, lon, start, end, cal):
     col   = ee.ImageCollection("MODIS/061/MOD11A2").map(scale_mod11a2)
     hist  = col.filterDate(HIST_START, HIST_END)
     rs, re = _recent_range()
+    bands = ["LST", "LST_Night"]
     return {
-        "cur_series":    extract_series(col.filterDate(start, end), geom, 1000, ["LST"]),
+        "cur_series":    extract_series(col.filterDate(start, end), geom, 1000, bands),
         "hist_stats":    extract_stats(hist.filter(ee.Filter.calendarRange(cal[0], cal[1], "month")),
-                                       geom, 1000, ["LST"]),
-        "recent_series": extract_series(col.filterDate(rs, re), geom, 1000, ["LST"]),
-        "monthly_clim":  extract_monthly_climatology(hist, geom, 1000, ["LST"]),
+                                       geom, 1000, bands),
+        "recent_series": extract_series(col.filterDate(rs, re), geom, 1000, bands),
+        "monthly_clim":  extract_monthly_climatology(hist, geom, 1000, bands),
     }
 
 
@@ -661,6 +662,9 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
                        opt_data["hist_stats"]["NBR"],   opt_data["monthly_clim"]["NBR"],   "nbr")
     lst   = _summarize(lst_data["cur_series"]["LST"],   lst_data["recent_series"]["LST"],
                        lst_hist,                        lst_data["monthly_clim"]["LST"],   "lst")
+    lst_night = _summarize(lst_data["cur_series"]["LST_Night"],   lst_data["recent_series"]["LST_Night"],
+                           lst_data["hist_stats"]["LST_Night"],   lst_data["monthly_clim"]["LST_Night"],
+                           "lst_night")
 
     # --- Derived indices ---
     vci_val = _vci(ndvi["current"], ndvi_hist["min"], ndvi_hist["max"])
@@ -720,7 +724,7 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
     indices = {
         "ndvi": ndvi, "evi": evi, "savi": savi,
         "ndwi": ndwi, "mndwi": mndwi, "vci": vci, "vhi": vhi,
-        "lst": lst, "tci": tci, "nbr": nbr,
+        "lst": lst, "lst_night": lst_night, "tci": tci, "nbr": nbr,
         "precipitation": precip_data,
         # Optional — may be None if GEE fetch failed
         "et":  et,

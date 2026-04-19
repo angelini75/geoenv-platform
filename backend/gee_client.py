@@ -59,13 +59,15 @@ def scale_mod09a1(img: ee.Image) -> ee.Image:
 
 
 def scale_mod11a2(img: ee.Image) -> ee.Image:
-    """MOD11A2: LST DN → Celsius"""
-    return (
-        img.select("LST_Day_1km")
-        .multiply(0.02).subtract(273.15)
-        .rename("LST")
-        .copyProperties(img, ["system:time_start"])
-    )
+    """MOD11A2: daytime + nighttime LST DN → Celsius (both bands in one image)."""
+    day   = (img.select("LST_Day_1km")
+               .multiply(0.02).subtract(273.15)
+               .rename("LST"))
+    night = (img.select("LST_Night_1km")
+               .multiply(0.02).subtract(273.15)
+               .rename("LST_Night"))
+    return (ee.Image([day, night])
+              .copyProperties(img, ["system:time_start"]))
 
 
 # ---------------------------------------------------------------------------
