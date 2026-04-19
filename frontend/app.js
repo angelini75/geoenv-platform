@@ -346,21 +346,36 @@ function renderIndexSections(data) {
 }
 
 // ── Index card ────────────────────────────────────────────────
+// Default: HIGH anomaly = GOOD for agriculture (NDVI, EVI, SAVI, NDWI, VCI, VHI, TCI, NBR, ET, SM…)
 const ANOMALY_MAP = {
-  "muy_alto":  { cls: "extreme",  color: "#e8425a", label: "Muy alto"   },
-  "alto":      { cls: "moderate", color: "#e5b93c", label: "Alto"       },
-  "normal":    { cls: "normal",   color: "#23d18b", label: "Normal"     },
-  "bajo":      { cls: "moderate", color: "#e5b93c", label: "Bajo"       },
-  "muy_bajo":  { cls: "extreme",  color: "#e8425a", label: "Muy bajo"   },
-  "sin_datos": { cls: "nodata",   color: "#1c2d42", label: "Sin datos"  },
+  "muy_alto":  { cls: "pos-extreme", color: "#00d68f", label: "Excelente" },
+  "alto":      { cls: "normal",      color: "#23d18b", label: "Bueno"     },
+  "normal":    { cls: "normal",      color: "#23d18b", label: "Normal"    },
+  "bajo":      { cls: "moderate",    color: "#e5b93c", label: "Deficiente"},
+  "muy_bajo":  { cls: "extreme",     color: "#e8425a", label: "Crítico"   },
+  "sin_datos": { cls: "nodata",      color: "#1c2d42", label: "Sin datos" },
 };
+
+// Inverted: HIGH anomaly = BAD (only LST — heat stress)
+const ANOMALY_MAP_INV = {
+  "muy_alto":  { cls: "extreme",  color: "#e8425a", label: "Calor extremo" },
+  "alto":      { cls: "moderate", color: "#e5b93c", label: "Cálido"        },
+  "normal":    { cls: "normal",   color: "#23d18b", label: "Normal"        },
+  "bajo":      { cls: "cold",     color: "#64b5f6", label: "Fresco"        },
+  "muy_bajo":  { cls: "cold",     color: "#4a9eff", label: "Helada"        },
+  "sin_datos": { cls: "nodata",   color: "#1c2d42", label: "Sin datos"     },
+};
+
+// Only LST (surface temperature) inverts the color logic
+const HIGH_IS_BAD = new Set(["LST"]);
 
 function idxCard(name, d, desc, unit = "") {
   if (!d) return "";
   const val = d.current;
   const z   = d.z_score;
   const pct = d.pct_deviation;
-  const ac  = ANOMALY_MAP[d.anomaly_class] || ANOMALY_MAP["sin_datos"];
+  const _map = HIGH_IS_BAD.has(name) ? ANOMALY_MAP_INV : ANOMALY_MAP;
+  const ac  = _map[d.anomaly_class] || ANOMALY_MAP["sin_datos"];
 
   // Get current-month percentiles from climatology
   const curMonth = new Date().getMonth() + 1;
