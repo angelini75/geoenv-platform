@@ -255,42 +255,46 @@ function renderDashboard(data) {
 }
 
 // ── Index card ───────────────────────────────────────────────────
-const ANOMALY_CLASS = {
-  "Normal":           "normal",
-  "Anomalía moderada":"moderate",
-  "Anomalía extrema": "extreme",
-  "Sin datos":        "nodata",
+// ANOMALY_MAP consolidates CSS class + direct color per anomaly type
+// (matches GeoEnv Design System spec: ANOMALY_MAP in ui_kits prototype)
+const ANOMALY_MAP = {
+  "Normal":            { cls: "normal",   color: "#23d18b" },
+  "Anomalía moderada": { cls: "moderate", color: "#e5b93c" },
+  "Anomalía extrema":  { cls: "extreme",  color: "#e8425a" },
+  "Sin datos":         { cls: "nodata",   color: "#1c2d42" },
 };
 
 function idxCard(name, d, desc, unit = "") {
-  const val  = d.current;
-  const z    = d.z_score;
-  const pct  = d.pct_deviation;
-  const acKey = ANOMALY_CLASS[d.anomaly_class] || "nodata";
+  const val = d.current;
+  const z   = d.z_score;
+  const pct = d.pct_deviation;
+  const ac  = ANOMALY_MAP[d.anomaly_class] || ANOMALY_MAP["Sin datos"];
 
-  const zW = z !== null ? Math.min(Math.abs(z) / 3 * 100, 100) : 0;
-  const zColor = { normal: "#23d18b", moderate: "#e5b93c", extreme: "#e8425a", nodata: "#1c2d42" }[acKey];
-  const valDisplay = val !== null && val !== undefined ? `${val.toFixed(3)}${unit}` : "N/D";
-  const zDisplay   = z   !== null && z   !== undefined ? `${z > 0 ? "+" : ""}${z.toFixed(2)}σ` : "N/D";
-  const pctDisplay = pct !== null && pct !== undefined ? ` · ${pct > 0 ? "+" : ""}${pct.toFixed(1)}%` : "";
+  const zW         = z !== null ? Math.min(Math.abs(z) / 3 * 100, 100) : 0;
+  const valDisplay = val !== null && val !== undefined
+    ? `${val.toFixed(val > 10 ? 1 : 3)}${unit}` : "N/D";
+  const zDisplay   = z   !== null && z   !== undefined
+    ? `${z > 0 ? "+" : ""}${z.toFixed(2)}σ` : "N/D";
+  const pctDisplay = pct !== null && pct !== undefined
+    ? ` · ${pct > 0 ? "+" : ""}${pct.toFixed(1)}%` : "";
   // R-005: hist_mean / hist_std can be null for VCI/TCI/VHI when monthly_clim unavailable
   const meanDisplay = d.hist_mean !== null && d.hist_mean !== undefined
-    ? `μ ${d.hist_mean.toFixed(3)}${unit}` : "μ N/D";
+    ? `μ ${d.hist_mean.toFixed(d.hist_mean > 10 ? 1 : 3)}${unit}` : "μ N/D";
   const stdDisplay  = d.hist_std  !== null && d.hist_std  !== undefined
-    ? ` · σ ${d.hist_std.toFixed(3)}` : "";
+    ? ` · σ ${d.hist_std.toFixed(d.hist_std > 10 ? 1 : 3)}` : "";
 
   return `
-  <div class="idx-card z-${acKey}" role="article" aria-label="${name}: ${valDisplay}">
+  <div class="idx-card z-${ac.cls}" role="article" aria-label="${name}: ${valDisplay}">
     <div class="idx-name">${name}</div>
     <div class="idx-desc" title="${desc}">${desc}</div>
-    <div class="idx-value c-${acKey}" aria-label="Valor actual">${valDisplay}</div>
-    <div class="idx-badge badge-${acKey}">${d.anomaly_class}</div>
+    <div class="idx-value" style="color:${val !== null ? ac.color : "var(--text-dim)"}" aria-label="Valor actual">${valDisplay}</div>
+    <div class="idx-badge badge-${ac.cls}">${d.anomaly_class}</div>
     <div class="idx-stats">
       ${meanDisplay}${stdDisplay}<br>
       <span class="z-val">${zDisplay}</span>${pctDisplay}
     </div>
     <div class="z-track" aria-hidden="true">
-      <div class="z-fill" style="width:${zW}%;background:${zColor}"></div>
+      <div class="z-fill" style="width:${zW}%;background:${ac.color}"></div>
     </div>
   </div>`;
 }
@@ -390,23 +394,22 @@ function renderPrecip(p) {
     container.innerHTML = `<p style="color:var(--text-dim);font-size:.77rem;padding:0 0 16px">Datos de precipitación no disponibles.</p>`;
     return;
   }
-  const acKey = ANOMALY_CLASS[p.anomaly_class] || "nodata";
-  const zFmt  = p.z_score !== null ? `${p.z_score > 0 ? "+" : ""}${p.z_score.toFixed(2)}σ` : "N/D";
+  const ac     = ANOMALY_MAP[p.anomaly_class] || ANOMALY_MAP["Sin datos"];
+  const zFmt   = p.z_score !== null ? `${p.z_score > 0 ? "+" : ""}${p.z_score.toFixed(2)}σ` : "N/D";
   const pctFmt = p.pct_deviation !== null ? ` (${p.pct_deviation > 0 ? "+" : ""}${p.pct_deviation.toFixed(1)}%)` : "";
-  const color = { normal: "var(--green)", moderate: "var(--yellow)", extreme: "var(--red)", nodata: "var(--text-dim)" }[acKey];
 
   container.innerHTML = `
     <div class="precip-card">
       <div class="precip-main">
         <div class="precip-label">Precipitación acumulada (${p.analysis_days} días)</div>
-        <div class="precip-val" style="color:${color}">${p.current_mm} mm</div>
+        <div class="precip-val" style="color:${ac.color}">${p.current_mm} mm</div>
       </div>
       <div class="precip-compare">
         Media histórica: <strong>${p.hist_mean_mm} mm</strong>${pctFmt}<br>
         Z-score: <strong>${zFmt}</strong>
       </div>
       <div class="precip-badge">
-        <span class="idx-badge badge-${acKey}">${p.anomaly_class}</span>
+        <span class="idx-badge badge-${ac.cls}">${p.anomaly_class}</span>
       </div>
     </div>`;
 }
