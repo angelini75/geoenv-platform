@@ -18,4 +18,6 @@ COPY frontend/ /app/static/
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Single worker: TTLCache is in-process memory; 2+ workers = separate caches (no sharing).
+# For multi-worker deployments, replace TTLCache with Redis.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
