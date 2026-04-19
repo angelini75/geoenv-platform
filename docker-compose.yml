@@ -12,6 +12,8 @@ services:
     volumes:
       # Mount the shared service-account key from the parent stack
       - /opt/mi-stack/secrets:/app/secrets:ro
+      # Mount frontend as live volume — git pull + restart is enough for UI changes
+      - ./frontend:/app/static:ro
     networks:
       - mi-stack_webnet
     labels:
