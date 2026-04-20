@@ -599,15 +599,12 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
 
     logger.info("Analysis: (%.4f, %.4f) scale=%s %s→%s", lat, lon, scale_label, start, end)
 
-    with ThreadPoolExecutor(max_workers=7) as pool:
+    with ThreadPoolExecutor(max_workers=5) as pool:
         # Core indicators (mandatory)
         f_veg    = pool.submit(_fetch_vegetation,   lat, lon, start, end, cal)
         f_opt    = pool.submit(_fetch_optical,      lat, lon, start, end, cal)
         f_lst    = pool.submit(_fetch_lst,          lat, lon, start, end, cal)
         f_precip = pool.submit(_fetch_precip,       lat, lon, start, end, cal)
-        # Optional indicators (run in parallel; failures → null, not 504)
-        f_et     = pool.submit(_fetch_et,           lat, lon, start, end, cal)
-        f_sm     = pool.submit(_fetch_soil_moisture, lat, lon, start, end, cal)
         f_static = pool.submit(extract_static_context, lat, lon)
 
         # R-007: bound the wait so a hung GEE call never freezes the uvicorn worker.
@@ -617,7 +614,7 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
             lst_data    = f_lst.result(timeout=GEE_TIMEOUT)
             precip_data = f_precip.result(timeout=GEE_TIMEOUT)
         except FutureTimeoutError:
-            for f in [f_veg, f_opt, f_lst, f_precip, f_et, f_sm, f_static]:
+            for f in [f_veg, f_opt, f_lst, f_precip, f_static]:
                 f.cancel()
             raise TimeoutError(
                 f"Earth Engine no respondió en {GEE_TIMEOUT}s. "
@@ -632,8 +629,6 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
                 logger.warning("Optional fetch '%s' failed: %s", name, exc)
                 return None
 
-        et_data     = _safe_result(f_et,     "et")
-        sm_data     = _safe_result(f_sm,     "soil_moisture")
         static_data = _safe_result(f_static, "static_context")
 
     # --- Measured indices ---
@@ -693,39 +688,11 @@ def run_analysis(lat: float, lon: float, scale_label: str) -> dict:
     vhi = _summarize([], vhi_recent, vhi_alltime, vhi_clim, "vhi",
                      current_override=vhi_val, current_date_override=ndvi_cur_date)
 
-    # --- Optional: ET (Evapotranspiración) ---
-    et = None
-    if et_data:
-        try:
-            et = _summarize(
-                et_data["cur_series"]["ET"],  et_data["recent_series"]["ET"],
-                et_data["hist_stats"]["ET"],  et_data["monthly_clim"]["ET"],
-                "et",
-            )
-        except Exception as exc:
-            logger.warning("ET summarize failed: %s", exc)
-
-    # --- Optional: Soil Moisture (SMAP) ---
-    sm = None
-    if sm_data:
-        try:
-            sm_hist = sm_data["hist_stats"]["ssm"]
-            sm = _summarize(
-                sm_data["cur_series"]["ssm"],  sm_data["recent_series"]["ssm"],
-                sm_hist,                        sm_data["monthly_clim"]["ssm"],
-                "sm",
-            )
-        except Exception as exc:
-            logger.warning("SM summarize failed: %s", exc)
-
     indices = {
         "ndvi": ndvi, "evi": evi, "savi": savi,
         "ndwi": ndwi, "mndwi": mndwi, "vci": vci, "vhi": vhi,
         "lst": lst, "lst_night": lst_night, "tci": tci, "nbr": nbr,
         "precipitation": precip_data,
-        # Optional — may be None if GEE fetch failed
-        "et":  et,
-        "sm":  sm,
     }
 
     indicator = _situation(indices)

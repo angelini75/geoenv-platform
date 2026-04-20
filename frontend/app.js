@@ -217,19 +217,17 @@ function showGlobalSpinner() {
       <div class="spin-ring" role="status" aria-label="Cargando análisis"></div>
       <div>
         <div class="spinner-text">Consultando Google Earth Engine…</div>
-        <div class="spinner-sub">MODIS + CHIRPS + ET + SMAP · paralelo · 15–30 seg</div>
+        <div class="spinner-sub">MODIS + CHIRPS · paralelo · 15–25 seg</div>
         <div class="spinner-steps" id="spinner-steps">
           <div class="spinner-step" data-step="veg">⏳ MOD13Q1 — NDVI / EVI</div>
           <div class="spinner-step" data-step="opt">⏳ MOD09A1 — NDWI / SAVI / NBR</div>
           <div class="spinner-step" data-step="lst">⏳ MOD11A2 — LST</div>
           <div class="spinner-step" data-step="pcp">⏳ CHIRPS — Precipitación</div>
-          <div class="spinner-step" data-step="et"> ⏳ MOD16A2 — ET</div>
-          <div class="spinner-step" data-step="sm"> ⏳ SMAP — Humedad suelo</div>
         </div>
       </div>
     </div>`;
   let i = 0;
-  const steps = ["veg","opt","lst","pcp","et","sm"];
+  const steps = ["veg","opt","lst","pcp"];
   clearInterval(document._spinnerTicker);
   document._spinnerTicker = setInterval(() => {
     if (i >= steps.length) { clearInterval(document._spinnerTicker); return; }
@@ -246,7 +244,7 @@ function clearAllSections() {
 
 /** Clear only per-point content — called on tab switch */
 function clearIndexSections() {
-  ["sit-banner","grid-veg","grid-water","grid-thermal","grid-hydro",
+  ["sit-banner","grid-veg","grid-water","grid-thermal",
    "precip-card","static-ctx-bar"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.innerHTML = "";
@@ -316,16 +314,6 @@ function renderIndexSections(data) {
     idxCard("LST", idx.lst, "Temperatura superficial", "°C") +
     idxCard("TCI", idx.tci, "Condición térmica") +
     idxCard("NBR", idx.nbr, "Degradación / fuego");
-
-  // ET + Soil Moisture (optional)
-  const hasET = idx.et && idx.et.current !== null;
-  const hasSM = idx.sm && idx.sm.current !== null;
-  if (hasET || hasSM) {
-    document.getElementById("section-hydro").style.display = "";
-    document.getElementById("grid-hydro").innerHTML =
-      (hasET ? idxCard("ET", idx.et, "Evapotranspiración real", " mm/8d") : "") +
-      (hasSM ? idxCard("SM", idx.sm, "Humedad superficial suelo", " mm")   : "");
-  }
 
   // Precipitation
   renderPrecip(idx.precipitation);
