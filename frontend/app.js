@@ -512,10 +512,11 @@ async function generateReport() {
   let reportError = null;
 
   try {
+    const userCtx = (document.getElementById("user-ctx")?.value || "").trim();
     const res = await fetch(`${API_BASE}/report`, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify(point.result),
+      body:    JSON.stringify({ ...point.result, _user_context: userCtx || null }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 

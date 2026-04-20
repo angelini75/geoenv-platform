@@ -143,6 +143,18 @@
         Generar Informe
       </button>
     </div>
+
+    <!-- User context for the AI report -->
+    <div class="user-ctx-wrap">
+      <label class="user-ctx-label" for="user-ctx">
+        <span aria-hidden="true">📝</span> Contexto del productor / lote
+        <span class="user-ctx-optional">(opcional)</span>
+      </label>
+      <textarea id="user-ctx" class="user-ctx-input" rows="3"
+        placeholder="Ej: Soja de primera campaña, siembra directa, antecesor trigo. Suelo franco-arcilloso. Lote de 80 ha con historial de sequía en 2022. Manejo: fungicida en V6. Objetivo de rinde 3.8 tn/ha…"></textarea>
+      <div class="user-ctx-hint">Esta información se incluirá en el análisis de Gemini junto con los datos satelitales.</div>
+    </div>
+
     <div class="report-body" id="report-body" aria-live="polite">
       <span style="color:var(--text-dim);font-size:.77rem">
         El informe se generará aquí tras hacer clic en "Generar Informe".

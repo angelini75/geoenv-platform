@@ -356,12 +356,26 @@ Escribe en español técnico, con precisión cuantitativa. Usa Markdown (## y **
 Objetivo: 600–900 palabras en 5 secciones ordenadas. No inventes datos ausentes del JSON."""
 
 
-def build_prompt(payload: dict) -> str:
+def build_prompt(payload: dict, user_context: str | None = None) -> str:
     payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
+
+    user_ctx_block = ""
+    if user_context:
+        user_ctx_block = f"""
+## CONTEXTO DEL PRODUCTOR / LOTE (proporcionado por el usuario)
+
+{user_context}
+
+> Integrá esta información en el análisis: adaptá las recomendaciones al cultivo/manejo indicado,
+> mencioná riesgos específicos para ese sistema productivo y priorizá las secciones más relevantes.
+
+---
+"""
+
     return f"""A continuación encontrarás el JSON completo del análisis ambiental.
 Cada índice incluye su valor actual, percentiles estacionales del mes en curso (p25/p50/p75),
 z-score estacional, climatología mensual histórica y tendencia de los últimos 6 meses.
-
+{user_ctx_block}
 ## DATOS DEL ANÁLISIS (JSON)
 
 ```json
@@ -375,6 +389,7 @@ z-score estacional, climatología mensual histórica y tendencia de los últimos
 Redacta el informe con estas 5 secciones en orden estricto:
 
 1. **Resumen ejecutivo** (3–4 oraciones): situación general, indicador de riesgo, región, estación.
+   Si el usuario proporcionó contexto de lote/cultivo, integralo aquí.
 
 2. **Estado del ecosistema**: analiza cuantitativamente cada grupo de índices
    (vegetación: NDVI/EVI/SAVI, agua/sequía: NDWI/MNDWI/VCI/VHI, temperatura: LST/TCI, fuego: NBR).
@@ -384,13 +399,14 @@ Redacta el informe con estas 5 secciones en orden estricto:
 3. **Tendencia reciente** (últimos 6 meses): interpreta la serie mensual real.
    ¿La situación mejora, empeora o es estable? ¿Hay cambio de tendencia reciente?
 
-4. **Impacto productivo-económico**: conecta los indicadores con la producción agropecuaria
-   y el contexto macroeconómico. Sigue la cadena causal proporcionada en los datos.
+4. **Impacto productivo-económico**: conecta los indicadores con la producción agropecuaria.
+   {"Si se indicó cultivo/manejo, personaliza el análisis para ese sistema (fenología, umbrales críticos, decisiones de manejo)." if user_context else "Sigue la cadena causal proporcionada en los datos."}
    Menciona cultivos en riesgo y cuantifica el impacto esperado.
 
 5. **Nivel de riesgo y recomendaciones**: concluye con el indicador de situación,
    las variables que lo determinan, y 2–3 acciones concretas y accionables
    (monitoreo satelital, decisiones agronómicas, alertas tempranas).
+   {"Adapta las recomendaciones al sistema productivo indicado por el usuario." if user_context else ""}
 
 Sé cuantitativo. Menciona incertidumbre cuando corresponda.
 Usa **negrita** para valores clave. No inventes datos que no estén en el JSON."""
@@ -409,9 +425,10 @@ def stream_report(analysis_data: dict):
         return
 
     try:
-        client  = genai.Client(api_key=api_key)
-        payload = build_llm_payload(analysis_data)
-        prompt  = build_prompt(payload)
+        client       = genai.Client(api_key=api_key)
+        user_context = analysis_data.pop("_user_context", None) or None
+        payload      = build_llm_payload(analysis_data)
+        prompt       = build_prompt(payload, user_context)
 
         response = client.models.generate_content_stream(
             model=MODEL,
