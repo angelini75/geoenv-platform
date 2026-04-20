@@ -287,15 +287,9 @@ body {
 .idx-card::before {
   content: ''; position: absolute; left: 0; top: 0; bottom: 0;
   width: 3px; border-radius: 3px 0 0 3px;
-  background: var(--border2);
+  background: var(--card-accent, var(--border2));
   transition: background .2s;
 }
-.idx-card.z-normal::before      { background: var(--green); }
-.idx-card.z-pos-extreme::before { background: #00d68f; }
-.idx-card.z-moderate::before    { background: var(--yellow); }
-.idx-card.z-extreme::before     { background: var(--red); }
-.idx-card.z-cold::before        { background: #64b5f6; }
-.idx-card.z-nodata::before      { background: var(--border2); }
 
 .idx-name {
   font-size: .65rem; font-weight: 600; text-transform: uppercase;
@@ -314,12 +308,7 @@ body {
   display: inline-block; font-size: .6rem; font-weight: 600;
   padding: 2px 7px; border-radius: 10px; margin-bottom: 8px;
 }
-.badge-normal       { background: rgba(35,209,139,.15);  color: var(--green); }
-.badge-pos-extreme  { background: rgba(0,214,143,.20);   color: #00d68f; }
-.badge-moderate     { background: rgba(229,185,60,.15);  color: var(--yellow); }
-.badge-extreme      { background: rgba(232,66,90,.15);   color: var(--red); }
-.badge-cold         { background: rgba(100,181,246,.18); color: #64b5f6; }
-.badge-nodata       { background: rgba(122,144,170,.1);  color: var(--text-dim); }
+.badge-nodata { background: rgba(122,144,170,.1); color: var(--text-dim); }
 
 .idx-stats {
   font-size: .63rem; color: var(--text-dim);

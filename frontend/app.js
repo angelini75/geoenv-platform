@@ -183,7 +183,6 @@ async function runAnalysis() {
   if (first) {
     state.activeId = first.id;
     renderDashboardFull();
-    fetchMarketData();
   } else {
     const errMsg = state.points.map(p => p.result?._error).filter(Boolean).join("; ");
     showDashboardError(errMsg || "Error desconocido");
@@ -248,7 +247,7 @@ function clearAllSections() {
 /** Clear only per-point content — called on tab switch */
 function clearIndexSections() {
   ["sit-banner","grid-veg","grid-water","grid-thermal","grid-hydro",
-   "precip-card","static-ctx-bar","socio-section"].forEach(id => {
+   "precip-card","static-ctx-bar"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.innerHTML = "";
   });
@@ -334,36 +333,30 @@ function renderIndexSections(data) {
   // Static context
   if (static_context) renderStaticContext(static_context);
 
-  // Socioeconomic
-  renderSocio(socio);
-
   // Enable report button
   const btnR = document.getElementById("btn-report");
   if (btnR) btnR.disabled = false;
-
-  // Show market if already loaded
-  if (state.marketData) renderMarket(state.marketData);
 }
 
 // ── Index card ────────────────────────────────────────────────
 // Default: HIGH anomaly = GOOD for agriculture (NDVI, EVI, SAVI, NDWI, VCI, VHI, TCI, NBR, ET, SM…)
 const ANOMALY_MAP = {
-  "muy_alto":  { cls: "pos-extreme", color: "#00d68f", label: "Excelente" },
-  "alto":      { cls: "normal",      color: "#23d18b", label: "Bueno"     },
-  "normal":    { cls: "normal",      color: "#23d18b", label: "Normal"    },
-  "bajo":      { cls: "moderate",    color: "#e5b93c", label: "Deficiente"},
-  "muy_bajo":  { cls: "extreme",     color: "#e8425a", label: "Crítico"   },
-  "sin_datos": { cls: "nodata",      color: "#1c2d42", label: "Sin datos" },
+  "muy_alto":  { color: "#00e676", bg: "rgba(0,230,118,.16)",    label: "Excelente"  },
+  "alto":      { color: "#23d18b", bg: "rgba(35,209,139,.13)",   label: "Bueno"      },
+  "normal":    { color: "#7a90aa", bg: "rgba(122,144,170,.12)",  label: "Normal"     },
+  "bajo":      { color: "#f07b3a", bg: "rgba(240,123,58,.15)",   label: "Deficiente" },
+  "muy_bajo":  { color: "#e8425a", bg: "rgba(232,66,90,.15)",    label: "Crítico"    },
+  "sin_datos": { color: "#3a4a5e", bg: "rgba(122,144,170,.08)",  label: "Sin datos"  },
 };
 
 // Inverted: HIGH anomaly = BAD (only LST — heat stress)
 const ANOMALY_MAP_INV = {
-  "muy_alto":  { cls: "extreme",  color: "#e8425a", label: "Calor extremo" },
-  "alto":      { cls: "moderate", color: "#e5b93c", label: "Cálido"        },
-  "normal":    { cls: "normal",   color: "#23d18b", label: "Normal"        },
-  "bajo":      { cls: "cold",     color: "#64b5f6", label: "Fresco"        },
-  "muy_bajo":  { cls: "cold",     color: "#4a9eff", label: "Helada"        },
-  "sin_datos": { cls: "nodata",   color: "#1c2d42", label: "Sin datos"     },
+  "muy_alto":  { color: "#e8425a", bg: "rgba(232,66,90,.15)",    label: "Calor extremo" },
+  "alto":      { color: "#f07b3a", bg: "rgba(240,123,58,.15)",   label: "Cálido"        },
+  "normal":    { color: "#7a90aa", bg: "rgba(122,144,170,.12)",  label: "Normal"        },
+  "bajo":      { color: "#64b5f6", bg: "rgba(100,181,246,.15)",  label: "Fresco"        },
+  "muy_bajo":  { color: "#7c6fff", bg: "rgba(124,111,255,.15)",  label: "Helada"        },
+  "sin_datos": { color: "#3a4a5e", bg: "rgba(122,144,170,.08)",  label: "Sin datos"     },
 };
 
 // Only LST (surface temperature) inverts the color logic
@@ -396,11 +389,11 @@ function idxCard(name, d, desc, unit = "") {
     ? ` [${p25.toFixed(Math.abs(p25) > 10 ? 1 : 2)}–${p75.toFixed(Math.abs(p75) > 10 ? 1 : 2)}]` : "";
 
   return `
-  <div class="idx-card z-${ac.cls}" role="article" aria-label="${name}: ${valDisplay}">
+  <div class="idx-card" style="--card-accent:${ac.color}" role="article" aria-label="${name}: ${valDisplay}">
     <div class="idx-name">${name}</div>
     <div class="idx-desc" title="${desc}">${desc}</div>
     <div class="idx-value" style="color:${val !== null ? ac.color : "var(--text-dim)"}">${valDisplay}</div>
-    <div class="idx-badge badge-${ac.cls}">${ac.label}</div>
+    <div class="idx-badge" style="background:${ac.bg};color:${ac.color}">${ac.label}</div>
     <div class="idx-stats">
       ${p50Disp}<span class="iqr-range">${iqrDisp}</span><br>
       <span class="z-val">${zDisplay}</span>${pctDisplay}
@@ -499,165 +492,6 @@ function renderStaticContext(ctx) {
       <span class="idx-section-sub">MERIT/SRTM · 90 m</span>
     </div>
     <div class="terrain-chips">${chips.join("")}</div>`;
-}
-
-// ── Socioeconomic ─────────────────────────────────────────────
-function renderSocio(socio) {
-  const el    = document.getElementById("socio-section");
-  const crops = socio.agriculture.crops_at_risk;
-  const cropTags = crops.length
-    ? crops.map(c => `<span class="crop-tag">${esc(c)}</span>`).join("")
-    : `<span style="color:var(--text-dim);font-size:.72rem">Ninguno identificado</span>`;
-
-  el.innerHTML = `
-    <div class="idx-section-header" style="margin-bottom:14px">
-      <span class="idx-section-icon" aria-hidden="true">💼</span>
-      <span class="idx-section-title">Contexto Socioeconómico</span>
-    </div>
-    <div class="socio-grid">
-      <div class="socio-cell">
-        <div class="socio-cell-label">Producción agropecuaria</div>
-        <div class="socio-cell-body">${esc(socio.agriculture.assessment)}</div>
-        ${crops.length ? `<div class="crops-list">${cropTags}</div>` : ""}
-      </div>
-      <div class="socio-cell">
-        <div class="socio-cell-label">Recurso hídrico &amp; Precipitación</div>
-        <div class="socio-cell-body">${esc(socio.water)}<br><br>${esc(socio.precipitation)}</div>
-      </div>
-      <div class="socio-cell">
-        <div class="socio-cell-label">Contexto térmico</div>
-        <div class="socio-cell-body">${esc(socio.thermal)}</div>
-      </div>
-    </div>
-    <div class="causality-box" role="note" aria-label="Cadena causal de impacto">
-      ${esc(socio.causality_chain)}
-    </div>
-    <details>
-      <summary style="font-size:.68rem;color:var(--text-dim);cursor:pointer;margin-bottom:6px">
-        Supuestos y fuentes
-      </summary>
-      <ul class="assumptions-box">
-        ${socio.assumptions.map(a => `<li>${esc(a)}</li>`).join("")}
-      </ul>
-    </details>`;
-}
-
-// ── Market data ───────────────────────────────────────────────
-async function fetchMarketData() {
-  try {
-    const res = await fetch(`${API_BASE}/market`);
-    if (!res.ok) return;
-    state.marketData = await res.json();
-    renderMarket(state.marketData);
-  } catch (_) { /* optional — fail silently */ }
-}
-
-function renderMarket(data) {
-  const section = document.getElementById("market-section");
-  const grid    = document.getElementById("market-grid");
-  const ts      = document.getElementById("market-ts");
-  if (!data) return;
-
-  ts.textContent = data._timestamp ? `actualizado ${data._timestamp.slice(0, 10)}` : "";
-
-  const fx     = data.fx     || {};
-  const granos = data.granos || {};
-  const macro  = data.macro  || {};
-  const siem   = data.siembra || {};
-
-  let html = "";
-
-  // ── FX row ──
-  const fxItems = [
-    { key:"oficial", icon:"💵", label:"Oficial"  },
-    { key:"ccl",     icon:"💹", label:"CCL"      },
-    { key:"mep",     icon:"📊", label:"MEP"      },
-    { key:"blue",    icon:"💙", label:"Blue"     },
-  ].filter(f => fx[f.key]?.venta);
-
-  if (fxItems.length) {
-    const oficialVenta = fx.oficial?.venta;
-    html += `<div class="market-row-label">💱 Tipos de cambio</div>
-    <div class="market-ticker-row">` +
-      fxItems.map(f => {
-        const venta = fx[f.key].venta;
-        const spread = (oficialVenta && f.key !== "oficial")
-          ? ` <span class="spread-chip">${((venta/oficialVenta - 1)*100).toFixed(0)}%</span>` : "";
-        return `<div class="market-chip">
-          <div class="market-chip-title">${f.icon} ${f.label}</div>
-          <div class="market-chip-val">$${venta.toLocaleString("es-AR")}</div>
-          <div class="market-chip-sub">venta${spread}</div>
-        </div>`;
-      }).join("") + `</div>`;
-  }
-
-  // ── Granos FAS row ──
-  const granosItems = [
-    { key:"soja_fas",    icon:"🌱", label:"Soja"    },
-    { key:"maiz_fas",    icon:"🌽", label:"Maíz"    },
-    { key:"trigo_fas",   icon:"🌾", label:"Trigo"   },
-    { key:"girasol_fas", icon:"🌻", label:"Girasol" },
-  ].filter(g => granos[g.key]?.valor);
-
-  if (granosItems.length) {
-    html += `<div class="market-row-label">🌾 Precios FAS (MAGyP)</div>
-    <div class="market-ticker-row">` +
-      granosItems.map(g => {
-        const v = granos[g.key];
-        return `<div class="market-chip">
-          <div class="market-chip-title">${g.icon} ${g.label}</div>
-          <div class="market-chip-val" style="color:var(--green)">$${Math.round(v.valor).toLocaleString("es-AR")}</div>
-          <div class="market-chip-sub">$/tn · ${v.fecha?.slice(0,7) || ""}</div>
-        </div>`;
-      }).join("") + `</div>`;
-  }
-
-  // ── Macro row ──
-  const macroChips = [];
-  if (macro.badlar?.valor) macroChips.push(
-    `<div class="market-chip"><div class="market-chip-title">📈 BADLAR</div>
-     <div class="market-chip-val" style="color:var(--yellow)">${macro.badlar.valor.toFixed(1)}%</div>
-     <div class="market-chip-sub">n.a. bancos priv.</div></div>`
-  );
-  if (macro.ipc_ng?.valor) macroChips.push(
-    `<div class="market-chip"><div class="market-chip-title">🧾 IPC m/m</div>
-     <div class="market-chip-val" style="color:var(--yellow)">${macro.ipc_ng.valor.toFixed(1)}%</div>
-     <div class="market-chip-sub">nivel gral INDEC · ${macro.ipc_ng.fecha?.slice(0,7) || ""}</div></div>`
-  );
-  if (macro.cer?.valor) macroChips.push(
-    `<div class="market-chip"><div class="market-chip-title">📉 CER</div>
-     <div class="market-chip-val">${macro.cer.valor.toLocaleString("es-AR")}</div>
-     <div class="market-chip-sub">índice BCRA · ${macro.cer.fecha?.slice(0,7) || ""}</div></div>`
-  );
-  if (macroChips.length) {
-    html += `<div class="market-row-label">📊 Macro</div>
-    <div class="market-ticker-row">${macroChips.join("")}</div>`;
-  }
-
-  // ── Avance siembra ──
-  const siembraItems = [
-    { key:"soja_siembra_pct",    icon:"🌱", label:"Soja"    },
-    { key:"maiz_siembra_pct",    icon:"🌽", label:"Maíz"    },
-    { key:"trigo_siembra_pct",   icon:"🌾", label:"Trigo"   },
-    { key:"girasol_siembra_pct", icon:"🌻", label:"Girasol" },
-  ].filter(s => siem[s.key]?.valor !== undefined && siem[s.key]?.valor !== null);
-
-  if (siembraItems.length) {
-    html += `<div class="market-row-label">🌱 Avance de siembra</div>
-    <div class="campaign-grid">` +
-      siembraItems.map(s => {
-        const pct = Math.min(100, Math.round(siem[s.key].valor));
-        return `<div class="campaign-row">
-          <span class="campaign-label">${s.icon} ${s.label}</span>
-          <progress class="campaign-bar" value="${pct}" max="100"></progress>
-          <span class="campaign-pct">${pct}%</span>
-        </div>`;
-      }).join("") + `</div>`;
-  }
-
-  if (!html) { section.style.display = "none"; return; }
-  grid.innerHTML = html;
-  section.style.display = "";
 }
 
 // ── AI Report ─────────────────────────────────────────────────
